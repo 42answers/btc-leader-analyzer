@@ -67,7 +67,13 @@ with st.sidebar:
     fee_key = fee_options[fee_label]
     fee_profile = FEE_MAP[fee_key]
 
-    with st.expander("Strategy Parameters", expanded=False):
+    skip_optuna = st.checkbox("Skip Optuna optimization", value=False,
+                              help="Optuna finds the best strategy parameters for this coin. "
+                                   "Takes 2-5 min. Without it, fallback defaults are used.")
+
+    with st.expander("Fallback / Manual Parameters", expanded=False):
+        st.caption("These are only used when Optuna is skipped. "
+                   "When Optuna runs, it finds optimal values automatically.")
         tp_pct = st.number_input("Take-Profit %", min_value=0.01, max_value=5.0, value=0.15, step=0.05, format="%.2f")
         sl_pct = st.number_input("Stop-Loss %", min_value=0.05, max_value=10.0, value=0.50, step=0.10, format="%.2f")
         btc_threshold = st.number_input("BTC Threshold %", min_value=0.05, max_value=3.0, value=0.50, step=0.10, format="%.2f")
@@ -79,9 +85,6 @@ with st.sidebar:
 
     leverage_levels = st.multiselect("Leverage Levels", [1, 2, 3, 5, 10, 20], default=[1, 3, 5, 10])
     capital = st.number_input("Initial Capital (EUR)", min_value=100, max_value=100000, value=1000, step=100)
-
-    skip_optuna = st.checkbox("Skip Optuna optimization", value=True,
-                              help="Optuna is slow (5-10 min). Skip for faster results.")
 
     st.divider()
     run_clicked = st.button("Run Analysis", type="primary", use_container_width=True)
@@ -116,7 +119,8 @@ if run_clicked:
     follower_symbol = f"{coin}USDT"
     leader_symbol = "BTCUSDT"
 
-    params = StrategyParams(
+    # Fallback params (used when Optuna is skipped)
+    fallback_params = StrategyParams(
         btc_window_s=btc_window,
         btc_threshold_pct=btc_threshold,
         tp_pct=tp_pct,
@@ -129,9 +133,11 @@ if run_clicked:
     end_date = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     start_date = end_date - timedelta(days=days)
 
+    n_steps = 7 if not skip_optuna else 6
+
     with st.status(f"Analyzing {coin}/BTC over {days} days...", expanded=True):
         # Step 1: Load data
-        st.write("Step 1/6: Loading tick data...")
+        st.write(f"Step 1/{n_steps}: Loading tick data...")
         _buf.truncate(0)
         _buf.seek(0)
         ts, btc_p, btc_v, f_p, f_v = data_mod.load_aligned_pair(
@@ -141,38 +147,74 @@ if run_clicked:
         )
         st.write(f"  Aligned: {len(ts):,} seconds ({len(ts)/3600:.1f} hours)")
 
-        # Step 2: Impulse detection
-        st.write("Step 2/6: Detecting BTC impulse events...")
+        # Step 2: Optuna optimization (finds optimal params)
+        optuna_result = None
+        params_source = "manual"
+        if not skip_optuna:
+            st.write(f"Step 2/{n_steps}: Optuna parameter optimization (300 trials)...")
+            from optimize import optimize_parameters
+            best_params, opt_summary = optimize_parameters(
+                ts, btc_p, btc_v, ts, f_p, f_v,
+                fee_profile, leverage=1.0, n_trials=300,
+            )
+            optuna_result = {"best_params": best_params, "summary": opt_summary}
+
+            # Build strategy params from Optuna results
+            params = StrategyParams(
+                btc_window_s=best_params["btc_window_s"],
+                btc_threshold_pct=best_params["btc_threshold_pct"],
+                tp_pct=best_params["tp_pct"],
+                sl_pct=best_params["sl_pct"],
+                max_hold_s=best_params["max_hold_s"],
+                cooldown_s=best_params["cooldown_s"],
+                min_volume_ratio=best_params["min_volume_ratio"],
+            )
+            params_source = "optuna"
+            st.write(f"  Best score: {opt_summary['best_score']:.4f}")
+            st.write(f"  Optimal: TP={params.tp_pct:.3f}% SL={params.sl_pct:.3f}% "
+                     f"BTC>{params.btc_threshold_pct:.3f}% window={params.btc_window_s:.0f}s")
+        else:
+            params = fallback_params
+            st.write("Step 2: Optuna skipped — using manual parameters")
+
+        step = 3
+
+        # Step 3: Impulse detection
+        st.write(f"Step {step}/{n_steps}: Detecting BTC impulse events...")
         events = impulse_mod.detect_impulse_events(
             ts, btc_p, btc_v, ts, f_p, f_v,
         )
         impulse_summary = impulse_mod.summarize_impulse_events(events)
         st.write(f"  Found {len(events):,} impulse events")
+        step += 1
 
-        # Step 3: Strategy simulation
-        st.write("Step 3/6: Simulating TP/SL strategy...")
+        # Step 4: Strategy simulation (with optimal or fallback params)
+        st.write(f"Step {step}/{n_steps}: Simulating TP/SL strategy ({params_source} params)...")
         strat_result = strategy_mod.simulate_tpsl_strategy(
             ts, btc_p, btc_v, ts, f_p, f_v,
             params, fee_profile, leverage=1.0,
         )
         strategy_trades = strat_result["trades"]
         st.write(f"  {strat_result['total_trades']} trades, {strat_result['win_rate']:.1f}% win rate")
+        step += 1
 
-        # Step 4: Baseline comparison
-        st.write("Step 4/6: Running random baseline (500 trials)...")
+        # Step 5: Baseline comparison
+        st.write(f"Step {step}/{n_steps}: Running random baseline (500 trials)...")
         baseline_result = baseline_mod.random_baseline_comparison(
             f_p, strategy_trades, params, fee_profile,
             leverage=1.0, n_trials=500,
         )
         st.write(f"  BTC trigger beats random: {baseline_result['percentile_rank_wr']:.0f}%")
+        step += 1
 
-        # Step 5: Regime classification
-        st.write("Step 5/6: Classifying market regimes...")
+        # Step 6: Regime classification
+        st.write(f"Step {step}/{n_steps}: Classifying market regimes...")
         regimes = regime_mod.classify_daily_regimes(ts, btc_p, ts, f_p, strategy_trades)
         regime_sum = regime_mod.regime_summary(regimes)
+        step += 1
 
-        # Step 6: Risk Monte Carlo
-        st.write("Step 6/6: Risk Monte Carlo (10k permutations)...")
+        # Step 7: Risk Monte Carlo
+        st.write(f"Step {step}/{n_steps}: Risk Monte Carlo (10k permutations)...")
         risk_result = risk_mod.risk_profile_monte_carlo(
             strategy_trades,
             leverage_levels=sorted(leverage_levels),
@@ -180,17 +222,6 @@ if run_clicked:
             initial_capital=capital,
             fee_rt_pct=fee_profile.round_trip_pct,
         )
-
-        # Step 7: Optuna (optional)
-        optuna_result = None
-        if not skip_optuna:
-            st.write("Step 7: Optuna optimization (this may take several minutes)...")
-            from optimize import optimize_parameters
-            best_params, opt_summary = optimize_parameters(
-                ts, btc_p, btc_v, ts, f_p, f_v,
-                fee_profile, leverage=1.0, n_trials=300,
-            )
-            optuna_result = {"best_params": best_params, "summary": opt_summary}
 
     # Store in session state
     st.session_state.results = {
@@ -203,6 +234,7 @@ if run_clicked:
             "end_date": end_date.strftime("%Y-%m-%d"),
             "data_points": len(ts),
             "strategy_params": params.__dict__,
+            "params_source": params_source,
             "fee_profile": fee_profile.name,
             "fee_rt_pct": fee_profile.round_trip_pct,
         },
@@ -235,8 +267,11 @@ trades = st.session_state.trades
 regimes = st.session_state.regimes
 
 st.header(f"{coin}/BTC Catch-Up Trade Analysis")
+params_source = res['meta'].get('params_source', 'manual')
+source_label = "Optuna-optimized" if params_source == "optuna" else "Manual fallback"
 st.caption(f"{res['meta']['start_date']} to {res['meta']['end_date']} ({res['meta']['days']} days) | "
-           f"Fee: {res['meta']['fee_profile']} ({res['meta']['fee_rt_pct']:.2f}% r/t)")
+           f"Fee: {res['meta']['fee_profile']} ({res['meta']['fee_rt_pct']:.2f}% r/t) | "
+           f"Params: {source_label}")
 
 # ── Tabs ──────────────────────────────────────────────────────────
 tab_overview, tab_strategy, tab_baseline, tab_regime, tab_risk, tab_optuna = st.tabs(
@@ -254,7 +289,7 @@ with tab_overview:
 
     st.divider()
 
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
     with col1:
         st.subheader("Strategy Breakdown")
         st.write(f"- **TP exits:** {strat['tp_rate']:.0f}%")
@@ -264,6 +299,16 @@ with tab_overview:
         st.write(f"- **Avg net/trade:** {strat['avg_net_pct']:+.4f}%")
 
     with col2:
+        sp = res['meta']['strategy_params']
+        st.subheader(f"Parameters ({source_label})")
+        st.write(f"- **TP:** {sp['tp_pct']:.3f}%")
+        st.write(f"- **SL:** {sp['sl_pct']:.3f}%")
+        st.write(f"- **BTC threshold:** >{sp['btc_threshold_pct']:.3f}%")
+        st.write(f"- **BTC window:** {sp['btc_window_s']:.0f}s")
+        st.write(f"- **Max hold:** {sp['max_hold_s']:.0f}s")
+        st.write(f"- **Cooldown:** {sp['cooldown_s']:.0f}s")
+
+    with col3:
         st.subheader("Impulse Summary")
         imp = res["impulse_summary"]
         st.write(f"- **Total events detected:** {imp['total_events']:,}")
@@ -420,7 +465,9 @@ with tab_risk:
 with tab_optuna:
     if "optuna" in res:
         opt = res["optuna"]
-        st.subheader("Optuna Best Parameters")
+        st.success("Optuna found the optimal parameters below. All strategy results use these values.")
+
+        st.subheader("Optimal Parameters (used for all results)")
         best = opt["best_params"]
 
         pc1, pc2 = st.columns(2)
@@ -444,7 +491,8 @@ with tab_optuna:
             }).sort_values("Importance", ascending=True)
             st.bar_chart(imp_df.set_index("Parameter"))
     else:
-        st.info("Optuna was skipped. Uncheck 'Skip Optuna' in the sidebar to run optimization.")
+        st.warning("Optuna was skipped — results use manual fallback parameters. "
+                   "Uncheck 'Skip Optuna' for best results.")
 
 # ── Downloads ─────────────────────────────────────────────────────
 st.divider()
