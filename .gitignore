@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.tick_cache/
+output/
+*.pdf
+.DS_Store

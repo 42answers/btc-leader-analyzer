@@ -1,0 +1,7 @@
+streamlit>=1.30
+numpy
+pandas
+rich
+requests
+optuna
+reportlab
