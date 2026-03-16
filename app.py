@@ -55,7 +55,8 @@ with st.sidebar:
     if custom_coin.strip():
         coin = custom_coin.strip().upper()
 
-    days = st.slider("Days to analyze", 1, 30, 7)
+    days = st.slider("Days to analyze", 1, 30, 14,
+                      help="14+ days recommended for regime diversity (bull/bear/flat).")
 
     fee_options = {
         "Binance Spot Taker (0.10%/leg)": "spot",
@@ -286,6 +287,32 @@ with tab_overview:
     c3.metric("Net Return", f"{strat['total_net_pct']:+.2f}%")
     c4.metric("Max Drawdown", f"{strat['max_drawdown_pct']:.1f}%")
     c5.metric("Beats Random", f"{baseline['percentile_rank_wr']:.0f}%")
+
+    # ── Sample quality warnings ──────────────────────────────────
+    regime_sum = res["regime_summary"]
+    regimes_present = [r for r in ["BULL", "BEAR", "FLAT"] if regime_sum.get(r, {}).get("days", 0) > 0]
+    regimes_missing = [r for r in ["BULL", "BEAR", "FLAT"] if r not in regimes_present]
+
+    if regimes_missing:
+        st.warning(
+            f"**Regime coverage gap:** No {', '.join(regimes_missing).lower()} days in this sample "
+            f"(only {', '.join(regimes_present).lower()}). "
+            f"Results may not generalize to all market conditions. "
+            f"Try increasing the analysis period to 14-30 days."
+        )
+    elif strat["total_trades"] < 50:
+        st.warning(
+            f"**Low trade count:** Only {strat['total_trades']} trades found. "
+            f"Results may not be statistically robust. "
+            f"Try increasing the analysis period."
+        )
+    else:
+        regime_days = {r: regime_sum.get(r, {}).get("days", 0) for r in ["BULL", "BEAR", "FLAT"]}
+        st.success(
+            f"**Good sample quality:** {sum(regime_days.values())} days covering "
+            f"{regime_days['BULL']} bull, {regime_days['BEAR']} bear, {regime_days['FLAT']} flat "
+            f"with {strat['total_trades']} trades."
+        )
 
     st.divider()
 
