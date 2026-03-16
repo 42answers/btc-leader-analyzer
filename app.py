@@ -225,10 +225,10 @@ if run_clicked:
         st.write(f"Step 2/{n_steps}: Suitability check (multi-timescale correlation)...")
         from scipy.stats import pearsonr
 
-        # Pass 1: coarse scan to find the region where correlation appears
-        coarse_scales = [1, 5, 10, 30, 60, 120, 300]
+        # Scan at key timescales: 1s through 5min
+        scan_scales = [1, 2, 3, 5, 10, 15, 30, 60, 120, 300]
         all_corrs = {}
-        for resample_s in coarse_scales:
+        for resample_s in scan_scales:
             step_size = max(1, resample_s)
             btc_ret = np.diff(btc_p[::step_size]) / btc_p[::step_size][:-1]
             fol_ret = np.diff(f_p[::step_size]) / f_p[::step_size][:-1]
@@ -239,92 +239,94 @@ if run_clicked:
             else:
                 all_corrs[resample_s] = 0.0
 
-        # Pass 2: zoom in around the transition zone (where r crosses 0.1)
-        # Find the two coarse scales that bracket the 0.1 threshold
-        sorted_scales = sorted(all_corrs.keys())
-        for i in range(len(sorted_scales) - 1):
-            lo_s, hi_s = sorted_scales[i], sorted_scales[i + 1]
-            lo_r, hi_r = all_corrs[lo_s], all_corrs[hi_s]
-            if lo_r < 0.08 and hi_r >= 0.08 and hi_s - lo_s > 2:
-                # Zoom: test intermediate scales in this gap
-                if hi_s <= 10:
-                    zoom_scales = range(lo_s + 1, hi_s)
-                elif hi_s <= 30:
-                    zoom_scales = range(lo_s + 2, hi_s, 2)
-                else:
-                    zoom_scales = range(lo_s + 5, hi_s, 5)
-                for zs in zoom_scales:
-                    step_size = max(1, zs)
-                    btc_ret = np.diff(btc_p[::step_size]) / btc_p[::step_size][:-1]
-                    fol_ret = np.diff(f_p[::step_size]) / f_p[::step_size][:-1]
-                    n_r = min(len(btc_ret), len(fol_ret))
-                    if n_r > 30:
-                        r, _ = pearsonr(btc_ret[:n_r], fol_ret[:n_r])
-                        all_corrs[zs] = round(r, 4)
-                break  # only zoom into the first transition
-
-        # Build display: show coarse scales + zoomed detail
-        suit_results = all_corrs  # full resolution for Optuna constraints
-
-        # For display, pick key scales: always show 1s, the onset, peak, and some context
-        display_scales = sorted(all_corrs.keys())
-        best_ts = max(all_corrs, key=all_corrs.get)
-        best_r = all_corrs[best_ts]
-
-        # Find onset: smallest scale where r >= 0.1
-        onset_s = None
-        for s in display_scales:
-            if all_corrs[s] >= 0.1:
-                onset_s = s
-                break
+        suit_results = all_corrs
 
         def _label(s):
             if s >= 60:
                 return f"{s // 60}min"
             return f"{s}s"
 
-        corr_parts = [f"{_label(k)}={all_corrs[k]:.3f}" for k in display_scales]
+        sorted_scales = sorted(all_corrs.keys())
+        best_ts = max(all_corrs, key=all_corrs.get)
+        best_r = all_corrs[best_ts]
+        r_1s = all_corrs.get(1, 0)
+        r_5min = all_corrs.get(300, all_corrs.get(max(all_corrs.keys()), 0))
+
+        # Classify the correlation profile shape
+        # "flat-weak": correlation is ~constant and low across all scales (no catch-up dynamic)
+        # "rising": correlation increases significantly from short to long (catch-up exists)
+        # "strong": high correlation even at 1s (tight follower)
+        corr_range = best_r - r_1s  # how much correlation grows from 1s to peak
+        is_flat = corr_range < 0.05  # less than 0.05 growth = flat profile
+        is_strong = r_1s >= 0.2
+        is_weak = best_r < 0.15
+
+        # Display: show key scales (not all 10)
+        display_keys = [1, 5, 10, 30, 60, 300]
+        display_keys = [k for k in display_keys if k in all_corrs]
+        corr_parts = [f"{_label(k)}={all_corrs[k]:.3f}" for k in display_keys]
         st.write(f"  Pearson r: {' | '.join(corr_parts)}")
-        if onset_s and onset_s > 1:
-            st.write(f"  Signal onset: **{_label(onset_s)}** (r crosses 0.1)")
 
-        # Store for display in overview — keep only key scales for clean UI
-        display_keys = [1]
-        if onset_s and onset_s not in display_keys:
-            display_keys.append(onset_s)
-        for s in [10, 30, 60, 300]:
-            if s not in display_keys and s in all_corrs:
-                display_keys.append(s)
-        display_keys = sorted(set(display_keys))
-        display_corrs = {k: all_corrs[k] for k in display_keys if k in all_corrs}
+        # Find onset: smallest scale where r >= 0.15 (meaningful, not just noise)
+        onset_s = None
+        for s in sorted_scales:
+            if all_corrs[s] >= 0.15:
+                onset_s = s
+                break
 
+        # Verdicts
+        if is_strong:
+            profile = "strong"
+            st.success(f"✅ {coin} closely tracks BTC even at 1s ({r_1s:.3f}). "
+                       f"Peak at {_label(best_ts)} ({best_r:.3f}). Strong catch-up candidate.")
+        elif is_flat and is_weak:
+            profile = "flat-weak"
+            st.error(f"🚫 {coin} shows weak, flat correlation across all scales ({r_1s:.3f}→{best_r:.3f}). "
+                     f"No catch-up dynamic detected. Results will likely be noise/overfitting.")
+        elif is_flat and not is_weak:
+            profile = "flat-moderate"
+            st.info(f"ℹ️ {coin} has constant moderate coupling ({r_1s:.3f}→{best_r:.3f}). "
+                    f"Moves with BTC but no distinct catch-up lag. "
+                    f"Strategy may work but isn't exploiting a timing edge.")
+        elif corr_range >= 0.1 and onset_s:
+            profile = "rising"
+            st.warning(f"⚠️ {coin} catch-up kicks in at {_label(onset_s)} ({all_corrs[onset_s]:.3f}). "
+                       f"Grows from {r_1s:.3f} at 1s to {best_r:.3f} at {_label(best_ts)}. "
+                       f"Strategy windows below {_label(onset_s)} will mostly trade noise.")
+        elif corr_range >= 0.05 and onset_s:
+            profile = "gradual"
+            st.warning(f"⚠️ {coin} shows gradual coupling from {_label(onset_s)} ({all_corrs[onset_s]:.3f}). "
+                       f"Weak catch-up dynamic ({r_1s:.3f}→{best_r:.3f}). Edge may be marginal.")
+        else:
+            profile = "none"
+            st.error(f"🚫 {coin} shows very weak correlation ({best_r:.3f} peak). "
+                     f"Catch-up trade thesis does not apply.")
+
+        # Store for display
+        display_corrs = {k: all_corrs[k] for k in display_keys}
         suitability = {
             "correlations": display_corrs,
             "all_correlations": all_corrs,
             "best_timescale": best_ts,
             "best_r": best_r,
             "onset_s": onset_s,
+            "profile": profile,
+            "corr_range": corr_range,
         }
 
-        if best_r < 0.05:
-            st.error(f"⚠️ {coin} shows near-zero correlation with BTC at all timescales. "
-                     f"The catch-up trade thesis does not apply to this coin. "
-                     f"Results below will likely be noise/overfitting.")
-        elif all_corrs.get(1, 0) < 0.1 and best_r >= 0.1:
-            st.warning(f"⚠️ {coin} follows BTC from {_label(onset_s or best_ts)} ({all_corrs.get(onset_s or best_ts, best_r):.3f}) "
-                       f"but NOT at 1s ({all_corrs.get(1, 0):.3f}). "
-                       f"Strategy windows below {_label(onset_s or best_ts)} will mostly trade noise.")
-        elif all_corrs.get(1, 0) >= 0.1:
-            st.success(f"✅ {coin} follows BTC even at 1s ({all_corrs[1]:.3f}). "
-                       f"Strongest at {_label(best_ts)} ({best_r:.3f}). Suitable for catch-up trading.")
-
         # ── Derive Optuna constraints from data ─────────────────────
-        # 1) Min window: smallest timescale where Pearson r >= 0.1
-        min_window_from_suit = 5.0
-        for ts_scale in sorted(all_corrs.keys()):
-            if all_corrs[ts_scale] >= 0.1:
-                min_window_from_suit = float(ts_scale)
-                break
+        # 1) Min window: based on profile shape, not just threshold crossing
+        if profile == "strong":
+            # Strong at 1s — let Optuna search freely
+            min_window_from_suit = 5.0
+        elif onset_s:
+            # Use onset where correlation becomes meaningful (r >= 0.15)
+            min_window_from_suit = float(onset_s)
+        elif profile in ("flat-weak", "none"):
+            # No real signal — force long window to limit damage
+            min_window_from_suit = 60.0
+        else:
+            min_window_from_suit = 10.0
 
         # 2) Cross-correlation peak lag → suggested window center
         from scipy.signal import correlate
@@ -661,15 +663,18 @@ with tab_overview:
         best_ts = suit["best_timescale"]
         best_r = suit["best_r"]
         onset_s = suit.get("onset_s")
+        profile = suit.get("profile", "")
         corr_str = " → ".join(f"**{_lbl(k)}** {v:.3f}" for k, v in sorted(corrs.items()))
-        if best_r < 0.05:
-            st.error(f"🚫 **Not suitable for catch-up trading.** Correlation: {corr_str}")
-        elif corrs.get(1, 0) < 0.1 and best_r >= 0.1:
+
+        if profile == "strong":
+            st.success(f"✅ **Strong BTC follower.** Correlation: {corr_str}")
+        elif profile == "flat-weak" or profile == "none":
+            st.error(f"🚫 **Weak, flat correlation — no catch-up dynamic.** {corr_str}")
+        elif profile == "flat-moderate":
+            st.info(f"ℹ️ **Constant coupling, no timing edge.** {corr_str}")
+        elif profile in ("rising", "gradual"):
             onset_label = _lbl(onset_s) if onset_s else _lbl(best_ts)
-            st.warning(f"⚠️ **Signal onset at {onset_label}.** Correlation: {corr_str}. "
-                       f"Strategy windows below {onset_label} will mostly trade noise.")
-        else:
-            st.success(f"✅ **Good BTC follower.** Correlation: {corr_str}")
+            st.warning(f"⚠️ **Catch-up from {onset_label}.** {corr_str}")
 
     # ── Sample quality warnings ──────────────────────────────────
     regime_sum = res["regime_summary"]
