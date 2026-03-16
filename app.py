@@ -91,6 +91,21 @@ with st.sidebar:
     run_clicked = st.button("Run Analysis", type="primary", use_container_width=True)
 
 
+# ── Cached data loader ────────────────────────────────────────────
+@st.cache_data(show_spinner=False, ttl=3600)
+def _load_pair_cached(leader: str, follower: str, start_iso: str, days: int):
+    """Cache tick data so repeat runs with same coin/period are instant.
+
+    Uses start_iso (string) instead of datetime for cache-key hashability.
+    TTL=3600s (1 hour) keeps data fresh without re-fetching every click.
+    """
+    start_date = datetime.fromisoformat(start_iso)
+    ts, l_p, l_v, f_p, f_v = data_mod.load_aligned_pair(
+        leader, follower, start_date, days,
+    )
+    return ts, l_p, l_v, f_p, f_v
+
+
 # ── Helper: build trades DataFrame ────────────────────────────────
 def trades_to_df(trades):
     rows = []
@@ -141,10 +156,10 @@ if run_clicked:
         st.write(f"Step 1/{n_steps}: Loading tick data...")
         _buf.truncate(0)
         _buf.seek(0)
-        ts, btc_p, btc_v, f_p, f_v = data_mod.load_aligned_pair(
+        ts, btc_p, btc_v, f_p, f_v = _load_pair_cached(
             leader_symbol.replace("USDT", "/USDT"),
             follower_symbol.replace("USDT", "/USDT"),
-            start_date, days,
+            start_date.isoformat(), days,
         )
         st.write(f"  Aligned: {len(ts):,} seconds ({len(ts)/3600:.1f} hours)")
 
