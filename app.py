@@ -69,9 +69,8 @@ with st.sidebar:
     fee_key = fee_options[fee_label]
     fee_profile = FEE_MAP[fee_key]
 
-    latency_ms = st.number_input("Execution Latency (ms)", min_value=0, max_value=5000, value=1000, step=100,
-                                    help="API latency before trade entry. Data resolution is 1s, "
-                                         "so values are rounded to the nearest second.")
+    exec_delay_s = st.number_input("Execution Latency (s)", min_value=0, max_value=5, value=1, step=1,
+                                    help="Seconds of API latency before trade entry (data resolution is 1s).")
 
     skip_optuna = st.checkbox("Skip Optuna optimization", value=False,
                               help="Optuna finds the best strategy parameters for this coin. "
@@ -140,7 +139,7 @@ if run_clicked:
     follower_symbol = f"{coin}USDT"
     leader_symbol = "BTCUSDT"
 
-    exec_delay_s = max(0, round(latency_ms / 1000))
+    exec_delay_s = max(0, int(exec_delay_s))
 
     # Fallback params (used when Optuna is skipped)
     fallback_params = StrategyParams(
