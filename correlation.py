@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import numpy as np
 from scipy import stats as sp_stats
 from scipy.signal import correlate as sp_correlate
+
+# Persistent history file (lives next to app.py)
+_HISTORY_PATH = Path(__file__).parent / "market_structure_history.json"
 
 
 # ── helpers ──────────────────────────────────────────────────────
@@ -217,3 +223,132 @@ def compute_cross_coin_comparison(
                 "status": f"error: {exc}",
             })
     return results
+
+
+# ── 5. Catch-up (recovery) time ─────────────────────────────────
+
+def compute_catchup_time(
+    btc_prices: np.ndarray,
+    follower_prices: np.ndarray,
+    window_s: int = 300,
+    threshold_pct: float = 0.3,
+    max_scan_s: int = 600,
+) -> dict:
+    """Measure how long the follower takes to catch up after BTC impulses.
+
+    For each significant BTC move (>threshold_pct in window_s), scans
+    follower second-by-second to find when follower's cumulative move
+    reaches 50% of BTC's impulse.
+
+    Returns dict:
+        median_catchup_s   – median seconds to reach 50% of BTC move
+        mean_catchup_s     – mean catch-up time
+        p25_catchup_s      – 25th percentile
+        p75_catchup_s      – 75th percentile
+        n_events           – number of impulses used
+        pct_no_catchup     – % of events where follower never caught up
+    """
+    n = len(btc_prices)
+    if n < window_s + max_scan_s + 10:
+        return {
+            "median_catchup_s": 0, "mean_catchup_s": 0,
+            "p25_catchup_s": 0, "p75_catchup_s": 0,
+            "n_events": 0, "pct_no_catchup": 0,
+        }
+
+    # Detect BTC impulses
+    btc_ret_window = (btc_prices[window_s:] - btc_prices[:-window_s]) / btc_prices[:-window_s] * 100
+    impulse_mask = np.abs(btc_ret_window) > threshold_pct
+
+    # Deduplicate: keep first event in each cluster (min_gap = window_s)
+    impulse_indices = np.where(impulse_mask)[0]
+    if len(impulse_indices) == 0:
+        return {
+            "median_catchup_s": 0, "mean_catchup_s": 0,
+            "p25_catchup_s": 0, "p75_catchup_s": 0,
+            "n_events": 0, "pct_no_catchup": 0,
+        }
+
+    deduped = [impulse_indices[0]]
+    for idx in impulse_indices[1:]:
+        if idx - deduped[-1] >= window_s:
+            deduped.append(idx)
+    deduped = np.array(deduped)
+
+    catchup_times = []
+    no_catchup_count = 0
+
+    for idx in deduped:
+        event_end = idx + window_s  # end of BTC impulse window
+        if event_end + max_scan_s >= n:
+            continue
+
+        btc_move = btc_ret_window[idx]  # BTC move % in window
+        target = btc_move * 0.5  # 50% catch-up threshold
+
+        # Follower's cumulative move from event_end onward
+        f_base = follower_prices[event_end]
+        if f_base <= 0:
+            continue
+
+        # Scan second by second
+        found = False
+        for t in range(1, max_scan_s + 1):
+            f_move = (follower_prices[event_end + t] - f_base) / f_base * 100
+            # For UP impulses, follower should move up; for DOWN, down
+            if btc_move > 0 and f_move >= target:
+                catchup_times.append(t)
+                found = True
+                break
+            elif btc_move < 0 and f_move <= target:
+                catchup_times.append(t)
+                found = True
+                break
+
+        if not found:
+            no_catchup_count += 1
+
+    total = len(catchup_times) + no_catchup_count
+    if len(catchup_times) == 0:
+        return {
+            "median_catchup_s": 0, "mean_catchup_s": 0,
+            "p25_catchup_s": 0, "p75_catchup_s": 0,
+            "n_events": total,
+            "pct_no_catchup": 100.0 if total > 0 else 0,
+        }
+
+    arr = np.array(catchup_times)
+    return {
+        "median_catchup_s": float(np.median(arr)),
+        "mean_catchup_s": float(np.mean(arr)),
+        "p25_catchup_s": float(np.percentile(arr, 25)),
+        "p75_catchup_s": float(np.percentile(arr, 75)),
+        "n_events": total,
+        "pct_no_catchup": round(no_catchup_count / total * 100, 1),
+    }
+
+
+# ── 6. Persistent history ──────────────────────────────────────
+
+def save_market_structure(coin: str, days: int, date_range: str, metrics: dict):
+    """Append/update market structure metrics for a coin to history file."""
+    history = load_market_structure_history()
+    key = f"{coin}_{days}d"
+    history[key] = {
+        "coin": coin,
+        "days": days,
+        "date_range": date_range,
+        **{k: v for k, v in metrics.items()
+           if isinstance(v, (int, float, str, bool))},
+    }
+    _HISTORY_PATH.write_text(json.dumps(history, indent=2, default=str))
+
+
+def load_market_structure_history() -> dict:
+    """Load all previously saved market structure snapshots."""
+    if _HISTORY_PATH.exists():
+        try:
+            return json.loads(_HISTORY_PATH.read_text())
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}

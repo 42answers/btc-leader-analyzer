@@ -4,3 +4,4 @@ __pycache__/
 output/
 *.pdf
 .DS_Store
+market_structure_history.json

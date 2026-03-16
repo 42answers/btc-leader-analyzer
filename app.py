@@ -216,8 +216,12 @@ if run_clicked:
         ccf_lags, ccf_values = correlation_mod.compute_cross_correlation_function(
             btc_p, f_p, max_lag_s=30,
         )
+        catchup_result = correlation_mod.compute_catchup_time(
+            btc_p, f_p, window_s=300, threshold_pct=0.3, max_scan_s=600,
+        )
         st.write(f"  Pearson={correlation_result['pearson_returns']:.3f}, "
-                 f"Beta={correlation_result['beta']:.2f}")
+                 f"Beta={correlation_result['beta']:.2f}, "
+                 f"Median catch-up={catchup_result['median_catchup_s']:.0f}s")
         step += 1
 
         # Step 5: Strategy simulation (with optimal or fallback params)
@@ -274,6 +278,7 @@ if run_clicked:
         "strategy": {k: v for k, v in strat_result.items() if k != "trades"},
         "baseline": {k: v for k, v in baseline_result.items() if not k.endswith("_distribution")},
         "correlation": correlation_result,
+        "catchup": catchup_result,
         "regime_summary": regime_sum,
         "risk": risk_result,
     }
@@ -293,6 +298,26 @@ if run_clicked:
     # Store for cross-coin comparison
     st.session_state.start_iso = start_date.isoformat()
     st.session_state.analysis_days = days
+
+    # Persist key metrics for cross-run comparison
+    peak_lag_s = int(ccf_lags[int(np.argmax(ccf_values))])
+    correlation_mod.save_market_structure(
+        coin, days,
+        f"{start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}",
+        {
+            "pearson": correlation_result["pearson_returns"],
+            "spearman": correlation_result["spearman_returns"],
+            "beta": correlation_result["beta"],
+            "beta_up": correlation_result["beta_up"],
+            "beta_down": correlation_result["beta_down"],
+            "relative_volatility": correlation_result["relative_volatility"],
+            "volume_correlation": correlation_result["volume_correlation"],
+            "peak_lag_s": peak_lag_s,
+            "impulse_median_lag_ms": impulse_summary["median_lag_ms"],
+            "median_catchup_s": catchup_result["median_catchup_s"],
+            "pct_no_catchup": catchup_result["pct_no_catchup"],
+        },
+    )
 
 
 # ── Display Results ───────────────────────────────────────────────
@@ -493,15 +518,18 @@ with tab_structure:
 
     with col_lag2:
         imp = res["impulse_summary"]
+        catchup = res.get("catchup", {})
         if "ccf_lags" in st.session_state:
             ccf = st.session_state.ccf_values
             lags = st.session_state.ccf_lags
             peak_idx = int(np.argmax(ccf))
             peak_lag = int(lags[peak_idx])
-            peak_corr = float(ccf[peak_idx])
 
             st.metric("CCF Peak Lag", f"{peak_lag}s")
             st.metric("Impulse Median Lag", f"{imp['median_lag_ms']:.0f}ms")
+            if catchup.get("n_events", 0) > 0:
+                st.metric("Median Catch-Up", f"{catchup['median_catchup_s']:.0f}s",
+                          help="Time for follower to reach 50% of BTC's move")
 
             if peak_lag > 0:
                 st.info(
@@ -515,6 +543,15 @@ with tab_structure:
                 )
             else:
                 st.write(f"No measurable lag between BTC and {coin} at 1-second resolution.")
+
+            # Catch-up detail
+            if catchup.get("n_events", 0) > 0:
+                st.caption(
+                    f"Catch-up: P25={catchup['p25_catchup_s']:.0f}s, "
+                    f"P75={catchup['p75_catchup_s']:.0f}s | "
+                    f"{catchup['pct_no_catchup']:.0f}% never caught up | "
+                    f"{catchup['n_events']} events"
+                )
 
     # ── Section 4: Cross-coin comparison ──────────────────────────
     st.divider()
@@ -587,6 +624,48 @@ with tab_structure:
         if err_data:
             for e in err_data:
                 st.caption(f"Could not load {e['coin']}: {e['status']}")
+
+    # ── Section 5: Previous analyses history ──────────────────────
+    history = correlation_mod.load_market_structure_history()
+    if len(history) > 1:
+        st.divider()
+        st.subheader("Previous Analyses")
+        st.caption("Saved from all prior runs — compare market structure across coins and periods.")
+
+        hist_rows = []
+        for key, h in history.items():
+            hist_rows.append({
+                "Coin": h.get("coin", "?"),
+                "Days": h.get("days", 0),
+                "Period": h.get("date_range", ""),
+                "Pearson r": h.get("pearson", 0),
+                "Beta": h.get("beta", 0),
+                "Rel. Vol": h.get("relative_volatility", 0),
+                "Peak Lag (s)": h.get("peak_lag_s", 0),
+                "Catch-Up (s)": h.get("median_catchup_s", 0),
+                "No Catch-Up %": h.get("pct_no_catchup", 0),
+            })
+
+        hist_df = pd.DataFrame(hist_rows)
+
+        def _highlight_active(row):
+            active_key = f"{coin}_{res['meta']['days']}d"
+            row_key = f"{row['Coin']}_{row['Days']}d"
+            if row_key == active_key:
+                return ["background-color: #2a4a2a"] * len(row)
+            return [""] * len(row)
+
+        st.dataframe(
+            hist_df.style.apply(_highlight_active, axis=1).format({
+                "Pearson r": "{:.3f}",
+                "Beta": "{:.2f}",
+                "Rel. Vol": "{:.2f}x",
+                "Peak Lag (s)": "{:.0f}",
+                "Catch-Up (s)": "{:.0f}",
+                "No Catch-Up %": "{:.0f}%",
+            }),
+            use_container_width=True,
+        )
 
 
 # ── Tab 3: Strategy ───────────────────────────────────────────────
