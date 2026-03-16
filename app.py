@@ -189,9 +189,9 @@ if run_clicked:
     end_date = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     start_date = end_date - timedelta(days=days)
 
-    n_steps = 7  # base steps (data, optuna/skip, impulse, market, strategy, baseline, regime, risk... but counted as 7 below)
+    n_steps = 8  # data, suitability, optuna/skip, impulse, market, strategy, baseline, regime+risk
     if not skip_optuna:
-        n_steps = 8
+        n_steps += 1  # optuna adds a step
     if not skip_optuna:
         n_steps += 1  # OOS test
     if run_walkforward and not skip_optuna:
@@ -221,11 +221,48 @@ if run_clicked:
                 st.write(f"  {cached_n} from cache, {dl_n} freshly downloaded")
         st.write(f"  Aligned: {len(ts):,} seconds ({len(ts)/3600:.1f} hours)")
 
-        # Step 2: Optuna optimization (finds optimal params)
+        # ── Suitability pre-check: multi-timescale correlation ────
+        st.write(f"Step 2/{n_steps}: Suitability check (multi-timescale correlation)...")
+        from scipy.stats import pearsonr
+        suit_results = {}
+        for resample_s in [1, 10, 60, 300]:
+            step_size = max(1, resample_s)
+            btc_ret = np.diff(btc_p[::step_size]) / btc_p[::step_size][:-1]
+            fol_ret = np.diff(f_p[::step_size]) / f_p[::step_size][:-1]
+            n_r = min(len(btc_ret), len(fol_ret))
+            if n_r > 30:
+                r, _ = pearsonr(btc_ret[:n_r], fol_ret[:n_r])
+                suit_results[resample_s] = round(r, 3)
+            else:
+                suit_results[resample_s] = 0.0
+
+        # Find the best timescale
+        best_ts = max(suit_results, key=suit_results.get)
+        best_r = suit_results[best_ts]
+        labels = {1: "1s", 10: "10s", 60: "1min", 300: "5min"}
+        corr_parts = [f"{labels[k]}={v:.3f}" for k, v in suit_results.items()]
+        st.write(f"  Pearson r: {' | '.join(corr_parts)}")
+
+        # Store for display in overview
+        suitability = {"correlations": suit_results, "best_timescale": best_ts, "best_r": best_r}
+
+        if best_r < 0.05:
+            st.error(f"⚠️ {coin} shows near-zero correlation with BTC at all timescales. "
+                     f"The catch-up trade thesis does not apply to this coin. "
+                     f"Results below will likely be noise/overfitting.")
+        elif suit_results.get(1, 0) < 0.1 and best_r >= 0.1:
+            st.warning(f"⚠️ {coin} follows BTC at {labels[best_ts]} ({best_r:.3f}) but NOT at 1s ({suit_results[1]:.3f}). "
+                       f"The catch-up signal exists but needs time to propagate. "
+                       f"Strategy windows <{best_ts}s will mostly trade noise.")
+        elif suit_results.get(1, 0) >= 0.1:
+            st.success(f"✅ {coin} follows BTC even at 1s ({suit_results[1]:.3f}). "
+                       f"Strongest at {labels[best_ts]} ({best_r:.3f}). Suitable for catch-up trading.")
+
+        # Step 3: Optuna optimization (finds optimal params)
         optuna_result = None
         params_source = "manual"
         if not skip_optuna:
-            st.write(f"Step 2/{n_steps}: Optuna parameter optimization (300 trials)...")
+            st.write(f"Step 3/{n_steps}: Optuna parameter optimization (300 trials)...")
             from optimize import optimize_parameters
             best_params, opt_summary = optimize_parameters(
                 ts, btc_p, btc_v, ts, f_p, f_v,
@@ -252,9 +289,9 @@ if run_clicked:
                      f"BTC>{params.btc_threshold_pct:.3f}% window={params.btc_window_s:.0f}s")
         else:
             params = fallback_params
-            st.write("Step 2: Optuna skipped — using manual parameters")
+            st.write("Step 3: Optuna skipped — using manual parameters")
 
-        step = 3
+        step = 4
 
         # Step 3: Impulse detection
         st.write(f"Step {step}/{n_steps}: Detecting BTC impulse events...")
@@ -402,6 +439,7 @@ if run_clicked:
         "catchup": catchup_result,
         "regime_summary": regime_sum,
         "risk": risk_result,
+        "suitability": suitability,
     }
     if optuna_result:
         st.session_state.results["optuna"] = optuna_result["summary"]
@@ -482,6 +520,22 @@ with tab_overview:
     c3.metric(f"Net Return{is_label}", f"{strat['total_net_pct']:+.2f}%")
     c4.metric("Max Drawdown", f"{strat['max_drawdown_pct']:.1f}%")
     c5.metric("Beats Random", f"{baseline['percentile_rank_wr']:.0f}%")
+
+    # ── Suitability indicator ────────────────────────────────────
+    suit = res.get("suitability")
+    if suit:
+        labels = {1: "1s", 10: "10s", 60: "1min", 300: "5min"}
+        corrs = suit["correlations"]
+        best_ts = suit["best_timescale"]
+        best_r = suit["best_r"]
+        corr_str = " → ".join(f"**{labels[k]}** {v:.3f}" for k, v in sorted(corrs.items()))
+        if best_r < 0.05:
+            st.error(f"🚫 **Not suitable for catch-up trading.** Correlation: {corr_str}")
+        elif corrs.get(1, 0) < 0.1 and best_r >= 0.1:
+            st.warning(f"⚠️ **Weak at 1s, stronger at {labels[best_ts]}.** Correlation: {corr_str}. "
+                       f"Strategy windows below {best_ts}s will mostly trade noise.")
+        else:
+            st.success(f"✅ **Good BTC follower.** Correlation: {corr_str}")
 
     # ── Sample quality warnings ──────────────────────────────────
     regime_sum = res["regime_summary"]
