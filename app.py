@@ -58,8 +58,8 @@ with st.sidebar:
     if custom_coin.strip():
         coin = custom_coin.strip().upper()
 
-    days = st.slider("Days to analyze", 1, 30, 14,
-                      help="14+ days recommended for regime diversity (bull/bear/flat).")
+    days = st.slider("Days to analyze", 7, 30, 30,
+                      help="30 days recommended for regime diversity and robust walk-forward validation.")
 
     fee_options = {
         "Binance Spot Taker (0.10%/leg)": "spot",
@@ -322,7 +322,7 @@ if run_clicked:
         # Out-of-sample test (run Optuna params on preceding period)
         oos_result_data = None
         if not skip_optuna:
-            oos_days = min(days, 14)  # match analysis length or cap at 14
+            oos_days = days  # test on same length period before analysis window
             oos_start = start_date - timedelta(days=oos_days)
             st.write(f"Step {step}/{n_steps}: Out-of-sample test ({oos_days}d before analysis window)...")
             try:
@@ -354,11 +354,13 @@ if run_clicked:
         # Walk-forward validation
         wf_result_data = None
         if run_walkforward and not skip_optuna:
-            train_d = max(7, days - 4)  # leave at least 4 days for test
-            test_d = min(4, days - 7)
-            if test_d < 2:
-                test_d = 2
-                train_d = days - test_d
+            # Walk-forward splits: 14d train / 7d test → ~3 folds on 30 days
+            train_d = min(14, days - 7)
+            test_d = 7
+            if train_d < 7:
+                # Fallback for very short periods
+                train_d = days // 2
+                test_d = max(3, days // 4)
             st.write(f"Step {step}/{n_steps}: Walk-forward validation "
                      f"(train={train_d}d, test={test_d}d)...")
             wf_result_data = wf_mod.run_walk_forward(
