@@ -25,6 +25,7 @@ import strategy as strategy_mod
 import baseline as baseline_mod
 import regime as regime_mod
 import risk as risk_mod
+import correlation as correlation_mod
 
 # Redirect all module consoles to buffer
 data_mod.console = _quiet_console
@@ -149,7 +150,7 @@ if run_clicked:
     end_date = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     start_date = end_date - timedelta(days=days)
 
-    n_steps = 7 if not skip_optuna else 6
+    n_steps = 8 if not skip_optuna else 7
 
     with st.status(f"Analyzing {coin}/BTC over {days} days...", expanded=True):
         # Step 1: Load data
@@ -204,7 +205,22 @@ if run_clicked:
         st.write(f"  Found {len(events):,} impulse events")
         step += 1
 
-        # Step 4: Strategy simulation (with optimal or fallback params)
+        # Step 4: Market structure analysis
+        st.write(f"Step {step}/{n_steps}: Computing market structure metrics...")
+        correlation_result = correlation_mod.compute_correlation_metrics(
+            btc_p, f_p, btc_v, f_v,
+        )
+        rolling_corr_ts, rolling_corr = correlation_mod.compute_rolling_correlation(
+            btc_p, f_p, ts, window_s=300,
+        )
+        ccf_lags, ccf_values = correlation_mod.compute_cross_correlation_function(
+            btc_p, f_p, max_lag_s=30,
+        )
+        st.write(f"  Pearson={correlation_result['pearson_returns']:.3f}, "
+                 f"Beta={correlation_result['beta']:.2f}")
+        step += 1
+
+        # Step 5: Strategy simulation (with optimal or fallback params)
         st.write(f"Step {step}/{n_steps}: Simulating TP/SL strategy ({params_source} params)...")
         strat_result = strategy_mod.simulate_tpsl_strategy(
             ts, btc_p, btc_v, ts, f_p, f_v,
@@ -214,7 +230,7 @@ if run_clicked:
         st.write(f"  {strat_result['total_trades']} trades, {strat_result['win_rate']:.1f}% win rate")
         step += 1
 
-        # Step 5: Baseline comparison
+        # Step 6: Baseline comparison
         st.write(f"Step {step}/{n_steps}: Running random baseline (500 trials)...")
         baseline_result = baseline_mod.random_baseline_comparison(
             f_p, strategy_trades, params, fee_profile,
@@ -223,13 +239,13 @@ if run_clicked:
         st.write(f"  BTC trigger beats random: {baseline_result['percentile_rank_wr']:.0f}%")
         step += 1
 
-        # Step 6: Regime classification
+        # Step 7: Regime classification
         st.write(f"Step {step}/{n_steps}: Classifying market regimes...")
         regimes = regime_mod.classify_daily_regimes(ts, btc_p, ts, f_p, strategy_trades)
         regime_sum = regime_mod.regime_summary(regimes)
         step += 1
 
-        # Step 7: Risk Monte Carlo
+        # Step 8: Risk Monte Carlo
         st.write(f"Step {step}/{n_steps}: Risk Monte Carlo (10k permutations)...")
         risk_result = risk_mod.risk_profile_monte_carlo(
             strategy_trades,
@@ -257,6 +273,7 @@ if run_clicked:
         "impulse_summary": impulse_summary,
         "strategy": {k: v for k, v in strat_result.items() if k != "trades"},
         "baseline": {k: v for k, v in baseline_result.items() if not k.endswith("_distribution")},
+        "correlation": correlation_result,
         "regime_summary": regime_sum,
         "risk": risk_result,
     }
@@ -268,6 +285,14 @@ if run_clicked:
     st.session_state.strat_result = strat_result
     st.session_state.baseline_result = baseline_result
     st.session_state.coin = coin
+    # Chart arrays for Market Structure tab (too large for JSON results dict)
+    st.session_state.rolling_corr_ts = rolling_corr_ts
+    st.session_state.rolling_corr = rolling_corr
+    st.session_state.ccf_lags = ccf_lags
+    st.session_state.ccf_values = ccf_values
+    # Store for cross-coin comparison
+    st.session_state.start_iso = start_date.isoformat()
+    st.session_state.analysis_days = days
 
 
 # ── Display Results ───────────────────────────────────────────────
@@ -290,8 +315,8 @@ st.caption(f"{res['meta']['start_date']} to {res['meta']['end_date']} ({res['met
            f"Params: {source_label}")
 
 # ── Tabs ──────────────────────────────────────────────────────────
-tab_overview, tab_strategy, tab_baseline, tab_regime, tab_risk, tab_optuna = st.tabs(
-    ["Overview", "Strategy", "Baseline", "Regime", "Risk", "Optuna"]
+tab_overview, tab_structure, tab_strategy, tab_baseline, tab_regime, tab_risk, tab_optuna = st.tabs(
+    ["Overview", "Market Structure", "Strategy", "Baseline", "Regime", "Risk", "Optuna"]
 )
 
 # ── Tab 1: Overview ───────────────────────────────────────────────
@@ -362,7 +387,213 @@ with tab_overview:
             st.write(f"- **Full follow:** {binary.get('full_follow_pct', 0):.0f}%")
             st.write(f"- **Overshoot:** {binary.get('overshoot_pct', 0):.0f}%")
 
-# ── Tab 2: Strategy ───────────────────────────────────────────────
+# ── Tab 2: Market Structure ───────────────────────────────────────
+with tab_structure:
+    corr = res["correlation"]
+
+    # ── Section 1: Correlation metric cards ────────────────────────
+    st.subheader("Correlation Analysis")
+    mc1, mc2, mc3, mc4, mc5 = st.columns(5)
+    mc1.metric("Pearson r", f"{corr['pearson_returns']:.3f}")
+    mc2.metric("Spearman rho", f"{corr['spearman_returns']:.3f}")
+    mc3.metric("R-squared", f"{corr['r_squared']:.3f}")
+    mc4.metric("Beta", f"{corr['beta']:.2f}")
+    mc5.metric("Rel. Volatility", f"{corr['relative_volatility']:.2f}x")
+
+    # Interpretation
+    p = corr["pearson_returns"]
+    if p > 0.8:
+        st.success(f"Strong positive correlation ({p:.3f}): {coin} closely tracks BTC price movements.")
+    elif p > 0.5:
+        st.info(f"Moderate correlation ({p:.3f}): {coin} generally follows BTC but with notable divergences.")
+    elif p > 0.2:
+        st.warning(f"Weak correlation ({p:.3f}): {coin} shows limited coupling to BTC at the 1-second level.")
+    else:
+        st.error(f"Very weak correlation ({p:.3f}): {coin} moves largely independently from BTC.")
+
+    st.divider()
+
+    ac1, ac2, ac3 = st.columns(3)
+    with ac1:
+        st.subheader("Asymmetry")
+        st.write(f"- **Beta (BTC up):** {corr['beta_up']:.3f}")
+        st.write(f"- **Beta (BTC down):** {corr['beta_down']:.3f}")
+        if corr["beta_up"] != 0:
+            ratio = corr["beta_down"] / corr["beta_up"]
+            if ratio > 1.1:
+                st.write(f"- {coin} amplifies BTC drops more than rallies ({ratio:.2f}x)")
+            elif ratio < 0.9:
+                st.write(f"- {coin} amplifies BTC rallies more than drops ({1/ratio:.2f}x)")
+            else:
+                st.write("- Symmetric response to BTC moves")
+
+    with ac2:
+        st.subheader("Regression")
+        st.write(f"- **Alpha:** {corr['alpha'] * 86400 * 100:.4f}%/day")
+        st.write(f"- **Beta:** {corr['beta']:.3f}")
+        st.write(f"- **R-squared:** {corr['r_squared']:.3f}")
+        if corr["beta"] > 1.0:
+            st.caption(f"{coin} amplifies BTC moves by {corr['beta']:.1f}x on average")
+        elif corr["beta"] < 1.0:
+            st.caption(f"{coin} dampens BTC moves (only {corr['beta']:.1f}x)")
+
+    with ac3:
+        st.subheader("Volume")
+        st.write(f"- **Volume correlation:** {corr['volume_correlation']:.3f}")
+        st.write(f"- **Rel. volatility:** {corr['relative_volatility']:.2f}x")
+        if corr["volume_correlation"] > 0.5:
+            st.caption("Strong volume coupling with BTC")
+        elif corr["volume_correlation"] > 0.2:
+            st.caption("Moderate volume coupling")
+        else:
+            st.caption("Weak volume coupling — independent activity patterns")
+
+    # ── Section 2: Rolling correlation chart ───────────────────────
+    st.divider()
+    st.subheader("Rolling Correlation (5-min window)")
+
+    if "rolling_corr_ts" in st.session_state:
+        roll_ts = st.session_state.rolling_corr_ts
+        roll_corr = st.session_state.rolling_corr
+
+        if len(roll_corr) > 0:
+            # Downsample to ~1 per minute for chart performance
+            step_size = max(1, 60)
+            roll_dates = pd.to_datetime(roll_ts[::step_size], unit="s", utc=True)
+
+            roll_df = pd.DataFrame({
+                "Time": roll_dates,
+                "Correlation": roll_corr[::step_size],
+            }).set_index("Time")
+
+            st.line_chart(roll_df, y="Correlation", use_container_width=True)
+            st.caption(
+                f"Rolling 5-minute Pearson correlation of 1-second returns. "
+                f"Mean: {np.mean(roll_corr):.3f}, "
+                f"Min: {np.min(roll_corr):.3f}, "
+                f"Max: {np.max(roll_corr):.3f}"
+            )
+
+    # ── Section 3: Lead-Lag cross-correlation ─────────────────────
+    st.divider()
+    st.subheader("Lead-Lag Structure")
+
+    col_lag1, col_lag2 = st.columns([2, 1])
+
+    with col_lag1:
+        if "ccf_lags" in st.session_state:
+            lags = st.session_state.ccf_lags
+            ccf = st.session_state.ccf_values
+
+            ccf_df = pd.DataFrame({
+                "Lag (seconds)": lags,
+                "Correlation": ccf,
+            }).set_index("Lag (seconds)")
+            st.bar_chart(ccf_df, y="Correlation", use_container_width=True)
+            st.caption(
+                "Cross-correlation function. Negative lag = follower leads BTC. "
+                "Positive lag = BTC leads follower. Peak shows the dominant relationship."
+            )
+
+    with col_lag2:
+        imp = res["impulse_summary"]
+        if "ccf_lags" in st.session_state:
+            ccf = st.session_state.ccf_values
+            lags = st.session_state.ccf_lags
+            peak_idx = int(np.argmax(ccf))
+            peak_lag = int(lags[peak_idx])
+            peak_corr = float(ccf[peak_idx])
+
+            st.metric("CCF Peak Lag", f"{peak_lag}s")
+            st.metric("Impulse Median Lag", f"{imp['median_lag_ms']:.0f}ms")
+
+            if peak_lag > 0:
+                st.info(
+                    f"BTC leads {coin} by ~{peak_lag}s on average. "
+                    f"This supports the catch-up trading thesis."
+                )
+            elif peak_lag < 0:
+                st.warning(
+                    f"{coin} appears to lead BTC by ~{abs(peak_lag)}s. "
+                    f"Unusual — may indicate reverse causality or noise."
+                )
+            else:
+                st.write(f"No measurable lag between BTC and {coin} at 1-second resolution.")
+
+    # ── Section 4: Cross-coin comparison ──────────────────────────
+    st.divider()
+    st.subheader("Cross-Coin Lag Comparison")
+
+    compare_coins = ["ETH", "SOL", "DOGE", "ADA", "AVAX", "LINK"]
+    compare_coins = [c for c in compare_coins if c != coin]
+
+    run_comparison = st.checkbox(
+        f"Run comparison across {len(compare_coins)} coins",
+        value=False,
+        help="Fetches data for other top coins to compare lag and correlation. "
+             "Uses cached data if previously analyzed. Takes 1-5 min if uncached.",
+    )
+
+    if run_comparison:
+        comparison_key = f"cross_coin_{coin}_{st.session_state.analysis_days}"
+        if comparison_key not in st.session_state:
+            with st.spinner(f"Loading and analyzing {len(compare_coins)} coins..."):
+                comp_results = correlation_mod.compute_cross_coin_comparison(
+                    compare_coins,
+                    st.session_state.start_iso,
+                    st.session_state.analysis_days,
+                    _load_pair_cached,
+                )
+                # Add current coin
+                comp_results.append({
+                    "coin": coin,
+                    "pearson": corr["pearson_returns"],
+                    "beta": corr["beta"],
+                    "median_lag_s": int(lags[int(np.argmax(ccf))]) if "ccf_lags" in st.session_state else 0,
+                    "relative_vol": corr["relative_volatility"],
+                    "status": "ok",
+                })
+                st.session_state[comparison_key] = comp_results
+
+        comp_data = st.session_state[comparison_key]
+        ok_data = [c for c in comp_data if c["status"] == "ok"]
+        err_data = [c for c in comp_data if c["status"] != "ok"]
+
+        if ok_data:
+            comp_df = pd.DataFrame(ok_data).sort_values("median_lag_s", ascending=True)
+
+            display_df = comp_df[["coin", "median_lag_s", "pearson", "beta", "relative_vol"]].copy()
+            display_df.columns = ["Coin", "Peak Lag (s)", "Pearson r", "Beta", "Rel. Vol"]
+
+            def _highlight_current(row):
+                if row["Coin"] == coin:
+                    return ["background-color: #2a4a2a"] * len(row)
+                return [""] * len(row)
+
+            st.dataframe(
+                display_df.style.apply(_highlight_current, axis=1).format({
+                    "Peak Lag (s)": "{:.0f}",
+                    "Pearson r": "{:.3f}",
+                    "Beta": "{:.2f}",
+                    "Rel. Vol": "{:.2f}x",
+                }),
+                use_container_width=True,
+            )
+
+            sorted_coins = list(comp_df.sort_values("median_lag_s")["coin"])
+            if coin in sorted_coins:
+                rank = sorted_coins.index(coin) + 1
+                st.write(
+                    f"**{coin}** ranks #{rank} out of {len(sorted_coins)} coins by lag "
+                    f"(lower = faster follower response to BTC)."
+                )
+
+        if err_data:
+            for e in err_data:
+                st.caption(f"Could not load {e['coin']}: {e['status']}")
+
+
+# ── Tab 3: Strategy ───────────────────────────────────────────────
 with tab_strategy:
     if trades:
         st.subheader("Equity Curve (1x leverage)")
