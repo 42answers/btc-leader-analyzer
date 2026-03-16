@@ -258,16 +258,26 @@ if run_clicked:
             st.success(f"✅ {coin} follows BTC even at 1s ({suit_results[1]:.3f}). "
                        f"Strongest at {labels[best_ts]} ({best_r:.3f}). Suitable for catch-up trading.")
 
+        # Determine minimum window from suitability: smallest timescale with r >= 0.1
+        min_window_from_suit = 5.0  # default (good follower)
+        for ts_scale in [1, 10, 60, 300]:
+            if suit_results.get(ts_scale, 0) >= 0.1:
+                min_window_from_suit = float(ts_scale)
+                break
+
         # Step 3: Optuna optimization (finds optimal params)
         optuna_result = None
         params_source = "manual"
         if not skip_optuna:
             st.write(f"Step 3/{n_steps}: Optuna parameter optimization (300 trials)...")
+            if min_window_from_suit > 5:
+                st.write(f"  Window floor set to {min_window_from_suit:.0f}s (correlation-based)")
             from optimize import optimize_parameters
             best_params, opt_summary = optimize_parameters(
                 ts, btc_p, btc_v, ts, f_p, f_v,
                 fee_profile, leverage=1.0, n_trials=300,
                 slippage_bps=slippage_bps_val,
+                min_window_s=min_window_from_suit,
             )
             optuna_result = {"best_params": best_params, "summary": opt_summary}
 

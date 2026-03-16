@@ -20,8 +20,15 @@ def optimize_parameters(
     n_trials: int = 300,
     seed: int = 42,
     slippage_bps: float = 0.0,
+    min_window_s: float = 5.0,
 ) -> tuple[dict, dict]:
     """Run Optuna Bayesian optimization for TP/SL strategy parameters.
+
+    Args:
+        min_window_s: Minimum BTC window in seconds. Derived from the suitability
+            check — set to the smallest timescale where Pearson r >= 0.1.
+            Prevents Optuna from fitting to noise at timescales where the
+            follower doesn't actually track BTC.
 
     Returns (best_params: dict, study_summary: dict).
     """
@@ -33,6 +40,10 @@ def optimize_parameters(
     fee_rt_pct = fee_profile.fee_per_leg * fee_profile.legs_per_trade * 100
     slip = slippage_bps / 10_000
 
+    # Clamp window range based on suitability
+    window_lo = max(5.0, min_window_s)
+    window_hi = max(window_lo * 4, 120.0)  # at least 4x headroom above floor
+
     # Fixed params (research-backed defaults — not optimized to reduce overfitting)
     FIXED_MAX_HOLD_S = 180    # catch-up completes in 60-120s per literature; 180s buffer
     FIXED_COOLDOWN_S = 45     # enough to avoid correlated signals
@@ -40,7 +51,7 @@ def optimize_parameters(
 
     def objective(trial):
         # Only optimize 4 core parameters (narrowed ranges based on market microstructure research)
-        btc_window_s = trial.suggest_float("btc_window_s", 5, 120, log=True)
+        btc_window_s = trial.suggest_float("btc_window_s", window_lo, window_hi, log=True)
         btc_threshold = trial.suggest_float("btc_threshold_pct", 0.10, 1.0, log=True)
         tp_pct = trial.suggest_float("tp_pct", 0.15, 0.80, log=True)  # floor above fee+slippage
         sl_pct = trial.suggest_float("sl_pct", 0.20, 1.5, log=True)   # floor above bid-ask noise
@@ -181,6 +192,12 @@ def optimize_parameters(
         "top_trials": top_trials,
         "param_importance": importance,
         "n_trials": n_trials,
+        "search_ranges": {
+            "btc_window_s": [window_lo, window_hi],
+            "btc_threshold_pct": [0.10, 1.0],
+            "tp_pct": [0.15, 0.80],
+            "sl_pct": [0.20, 1.5],
+        },
     }
 
     return best, summary
