@@ -546,62 +546,55 @@ with tab_overview:
     if oos_data or wf_data:
         st.divider()
         st.subheader("Validation (Out-of-Sample)")
-        st.caption("These metrics are tested on data Optuna never saw \u2014 the numbers you should trust.")
-
-        if oos_data and wf_data:
-            vc1, vc2 = st.columns(2)
-        elif oos_data:
-            vc1 = st.container()
-        else:
-            vc2 = st.container()
+        st.caption("Tested on data Optuna never saw \u2014 the numbers you should trust.")
 
         if oos_data:
-            with vc1:
-                st.markdown("**Out-of-Sample Test**")
-                oos_wr = oos_data.get("win_rate", 0)
-                oos_avg = oos_data.get("avg_net", 0)
-                oos_total = oos_data.get("total_return", 0)
-                oos_trades = oos_data.get("n_trades", 0)
+            st.markdown("**OOS Test** \u2014 Same params on unseen period")
+            oos_wr = oos_data.get("win_rate", 0)
+            oos_avg = oos_data.get("avg_net", 0)
+            oos_total = oos_data.get("total_return", 0)
+            oos_trades = oos_data.get("n_trades", 0)
+            oos_dd = oos_data.get("max_dd", 0)
 
-                oc1, oc2, oc3, oc4 = st.columns(4)
-                oc1.metric("OOS Win Rate", f"{oos_wr:.1f}%",
-                           delta=f"{oos_wr - strat['win_rate']:.1f}pp vs IS")
-                oc2.metric("OOS Avg Net", f"{oos_avg:+.4f}%",
-                           delta=f"{oos_avg - strat['avg_net_pct']:+.4f}% vs IS")
-                oc3.metric("OOS Total Return", f"{oos_total:+.2f}%")
-                oc4.metric("OOS Trades", oos_trades)
+            oc1, oc2, oc3 = st.columns(3)
+            oc1.metric("Win Rate", f"{oos_wr:.1f}%",
+                       delta=f"{oos_wr - strat['win_rate']:+.1f}pp vs IS")
+            oc2.metric("Total Return", f"{oos_total:+.2f}%",
+                       delta=f"{oos_total - strat['total_net_pct']:+.2f}% vs IS")
+            oc3.metric("Trades / Avg Net", f"{oos_trades} / {oos_avg:+.3f}%")
 
-                # Verdict
-                if oos_avg > 0 and oos_wr > 50:
-                    st.success("Edge survives out-of-sample.")
-                elif oos_avg > 0:
-                    st.info("Positive OOS returns but low win rate \u2014 edge is fragile.")
-                else:
-                    st.error("OOS returns are negative \u2014 in-sample results are likely overfitted.")
+            if oos_avg > 0 and oos_wr > 50:
+                st.success("Edge survives out-of-sample.")
+            elif oos_avg > 0:
+                st.info("Positive OOS returns but low win rate \u2014 edge is fragile.")
+            else:
+                st.error("OOS returns negative \u2014 likely overfitted.")
 
         if wf_data:
-            with vc2:
-                st.markdown("**Walk-Forward Validation**")
-                wf_agg = wf_data.get("aggregate_oos", {})
-                wf_deg = wf_data.get("degradation_pct", 0)
-                wf_folds = wf_data.get("n_folds", 0)
-                wf_wr = wf_agg.get("win_rate", 0)
-                wf_avg = wf_agg.get("avg_net", 0)
+            wf_agg = wf_data.get("aggregate_oos", {})
+            wf_deg = wf_data.get("degradation_pct", 0)
+            wf_folds = wf_data.get("n_folds", 0)
+            wf_wr = wf_agg.get("win_rate", 0)
+            wf_avg = wf_agg.get("avg_net", 0)
 
-                wc1, wc2, wc3, wc4 = st.columns(4)
-                wc1.metric("WF OOS Win Rate", f"{wf_wr:.1f}%")
-                wc2.metric("WF OOS Avg Net", f"{wf_avg:+.4f}%")
-                wc3.metric("Degradation", f"{wf_deg:.0f}%",
-                           help="How much worse OOS is vs in-sample. Lower = more robust.")
-                wc4.metric("Folds", wf_folds)
+            st.markdown(f"**Walk-Forward** \u2014 {wf_folds} folds, re-optimized per fold")
+            wc1, wc2, wc3 = st.columns(3)
+            wc1.metric("Win Rate", f"{wf_wr:.1f}%")
+            wc2.metric("Avg Net / Trade", f"{wf_avg:+.4f}%")
+            deg_abs = abs(wf_deg)
+            wc3.metric("Degradation", f"{deg_abs:.0f}%",
+                       help="How much worse OOS is vs in-sample. <30% = robust, >70% = overfitted.")
 
-                # Verdict
-                if wf_deg < 30 and wf_avg > 0:
-                    st.success(f"Robust: only {wf_deg:.0f}% degradation across {wf_folds} folds.")
-                elif wf_avg > 0:
-                    st.warning(f"Moderate degradation ({wf_deg:.0f}%) \u2014 edge exists but weakens out-of-sample.")
-                else:
-                    st.error(f"Walk-forward OOS is negative \u2014 strategy does not generalize.")
+            if wf_folds < 2:
+                st.warning(f"Only {wf_folds} fold \u2014 need 3+ folds for reliable walk-forward. Increase analysis days.")
+            elif wf_avg > 0 and 0 <= wf_deg < 30:
+                st.success(f"Robust: {deg_abs:.0f}% degradation across {wf_folds} folds.")
+            elif wf_avg > 0 and wf_deg < 70:
+                st.warning(f"{deg_abs:.0f}% degradation \u2014 edge exists but weakens OOS.")
+            elif wf_avg > 0:
+                st.warning(f"High degradation ({deg_abs:.0f}%) \u2014 OOS positive but fragile.")
+            else:
+                st.error("Walk-forward OOS negative \u2014 strategy does not generalize.")
     elif params_source == "optuna":
         st.divider()
         st.info("Enable **Walk-forward validation** in the sidebar for out-of-sample robustness testing.")
