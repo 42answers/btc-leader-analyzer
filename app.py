@@ -406,19 +406,12 @@ if run_clicked:
         regime_sum = regime_mod.regime_summary(regimes)
         step += 1
 
-        # Risk Monte Carlo
-        st.write(f"Step {step}/{n_steps}: Risk Monte Carlo (10k permutations)...")
-        risk_result = risk_mod.risk_profile_monte_carlo(
-            strategy_trades,
-            leverage_levels=sorted(leverage_levels),
-            n_permutations=10000,
-            initial_capital=capital,
-            fee_rt_pct=fee_profile.round_trip_pct,
-        )
+        step_risk = step  # save for later — run Risk MC after OOS so we can use OOS trades
         step += 1
 
         # Out-of-sample test (run Optuna params on preceding period)
         oos_result_data = None
+        oos_trades_list = []
         if not skip_optuna:
             oos_days = min(days, 14)  # cap at 14d to avoid Streamlit Cloud timeout
             oos_start = start_date - timedelta(days=oos_days)
@@ -433,6 +426,7 @@ if run_clicked:
                     ts_oos, btc_oos, btcv_oos, ts_oos, f_oos, fv_oos,
                     params, fee_profile, leverage=1.0,
                 )
+                oos_trades_list = oos_strat["trades"]
                 oos_result_data = {
                     "period": f"{oos_start.strftime('%Y-%m-%d')} to {start_date.strftime('%Y-%m-%d')}",
                     "days": oos_days,
@@ -476,6 +470,21 @@ if run_clicked:
                      f"OOS avg net: {wf_result_data['aggregate_oos']['avg_net']:+.4f}% | "
                      f"Degradation: {wf_result_data['degradation_pct']:.0f}%")
 
+        # Risk Monte Carlo — prefer OOS trades for realistic risk estimate
+        risk_trades_source = "in-sample"
+        risk_trades = strategy_trades
+        if oos_trades_list and len(oos_trades_list) >= 10:
+            risk_trades = oos_trades_list
+            risk_trades_source = "out-of-sample"
+        st.write(f"Step {step_risk}/{n_steps}: Risk Monte Carlo (10k permutations, {risk_trades_source} trades)...")
+        risk_result = risk_mod.risk_profile_monte_carlo(
+            risk_trades,
+            leverage_levels=sorted(leverage_levels),
+            n_permutations=10000,
+            initial_capital=capital,
+            fee_rt_pct=fee_profile.round_trip_pct,
+        )
+
     # Store in session state
     st.session_state.results = {
         "meta": {
@@ -499,6 +508,7 @@ if run_clicked:
         "catchup": catchup_result,
         "regime_summary": regime_sum,
         "risk": risk_result,
+        "risk_source": risk_trades_source,
         "suitability": suitability,
     }
     if optuna_result:
@@ -716,9 +726,29 @@ with tab_overview:
 # ── Tab 2: Market Structure ───────────────────────────────────────
 with tab_structure:
     corr = res["correlation"]
+    suit_ms = res.get("suitability", {})
 
-    # ── Section 1: Correlation metric cards ────────────────────────
-    st.subheader("Correlation Analysis")
+    # ── Section 0: Multi-timescale correlation ──────────────────
+    if suit_ms and "correlations" in suit_ms:
+        st.subheader("Multi-Timescale Correlation")
+        st.caption("Pearson r at different return intervals. The strategy operates at 1s but the catch-up signal plays out over longer scales.")
+
+        ts_labels = {1: "1s", 10: "10s", 60: "1min", 300: "5min"}
+        ts_corrs = suit_ms["correlations"]
+        ms_cols = st.columns(len(ts_corrs))
+        for i, (scale, r_val) in enumerate(sorted(ts_corrs.items())):
+            ms_cols[i].metric(f"Pearson ({ts_labels[scale]})", f"{r_val:.3f}")
+
+        best_scale = suit_ms.get("best_timescale", 1)
+        best_r_val = suit_ms.get("best_r", 0)
+        if best_scale > 1 and ts_corrs.get(1, 0) < 0.1:
+            st.info(f"Correlation kicks in at **{ts_labels[best_scale]}** ({best_r_val:.3f}). "
+                    f"The 1s metrics below are noise-dominated — focus on the {ts_labels[best_scale]} scale for this coin.")
+
+        st.divider()
+
+    # ── Section 1: Correlation metric cards (1s resolution) ──────
+    st.subheader("Correlation Analysis (1s resolution)")
     mc1, mc2, mc3, mc4, mc5 = st.columns(5)
     mc1.metric("Pearson r", f"{corr['pearson_returns']:.3f}")
     mc2.metric("Spearman rho", f"{corr['spearman_returns']:.3f}")
@@ -726,14 +756,18 @@ with tab_structure:
     mc4.metric("Beta", f"{corr['beta']:.2f}")
     mc5.metric("Rel. Volatility", f"{corr['relative_volatility']:.2f}x")
 
-    # Interpretation
+    # Interpretation — account for multi-timescale
     p = corr["pearson_returns"]
+    best_scale_s = suit_ms.get("best_timescale", 1) if suit_ms else 1
     if p > 0.8:
         st.success(f"Strong positive correlation ({p:.3f}): {coin} closely tracks BTC price movements.")
     elif p > 0.5:
         st.info(f"Moderate correlation ({p:.3f}): {coin} generally follows BTC but with notable divergences.")
     elif p > 0.2:
         st.warning(f"Weak correlation ({p:.3f}): {coin} shows limited coupling to BTC at the 1-second level.")
+    elif best_scale_s > 1 and suit_ms.get("best_r", 0) > 0.1:
+        st.warning(f"Near-zero at 1s ({p:.3f}) but correlates at {ts_labels.get(best_scale_s, '?')} "
+                   f"({suit_ms['best_r']:.3f}). Catch-up is slow — the signal needs time to propagate.")
     else:
         st.error(f"Very weak correlation ({p:.3f}): {coin} moves largely independently from BTC.")
 
@@ -1189,6 +1223,15 @@ with tab_regime:
 with tab_risk:
     st.subheader("Monte Carlo Risk Profile")
 
+    risk_src = res.get("risk_source", "in-sample")
+    if risk_src == "out-of-sample":
+        st.success("Risk metrics based on **out-of-sample trades** — realistic estimate.")
+    elif params_source == "optuna":
+        st.warning("⚠️ Risk metrics based on **in-sample trades** (Optuna-optimized). "
+                   "Real risk is likely worse. Enable OOS test with ≥10 trades for realistic estimates.")
+    else:
+        st.caption("Risk metrics based on manual-parameter trades.")
+
     risk_data = res["risk"]
     risk_rows = []
     for key in sorted(risk_data.keys(), key=lambda x: float(x)):
@@ -1240,6 +1283,29 @@ with tab_optuna:
             st.write(f"- **Cooldown:** {best.get('cooldown_s', 0):.0f}s")
             st.write(f"- **Volume Ratio:** >{best.get('min_volume_ratio', 0):.1f}x")
             st.write(f"- **Best Score:** {opt.get('best_score', 0):.4f}")
+
+        # Search ranges (data-driven constraints)
+        ranges = opt.get("search_ranges", {})
+        if ranges:
+            st.subheader("Search Ranges (data-driven)")
+            st.caption("Ranges constrained by suitability analysis: correlation timescale, noise floor, and BTC impulse distribution.")
+            range_rows = []
+            range_labels = {
+                "btc_window_s": "BTC Window (s)",
+                "btc_threshold_pct": "BTC Threshold (%)",
+                "tp_pct": "Take-Profit (%)",
+                "sl_pct": "Stop-Loss (%)",
+            }
+            for key, (lo, hi) in ranges.items():
+                chosen = best.get(key, 0)
+                range_rows.append({
+                    "Parameter": range_labels.get(key, key),
+                    "Min": f"{lo:.3f}",
+                    "Max": f"{hi:.3f}",
+                    "Chosen": f"{chosen:.3f}",
+                    "Position": f"{(chosen - lo) / (hi - lo) * 100:.0f}%" if hi > lo else "—",
+                })
+            st.table(pd.DataFrame(range_rows))
 
         importance = opt.get("param_importance", {})
         if importance:
