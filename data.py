@@ -38,14 +38,39 @@ def fetch_agg_trades(symbol: str, start_ms: int, end_ms: int,
 
     console.print(f"  Fetching {symbol} aggTrades...")
 
-    base_url = "https://api.binance.com/api/v3/aggTrades"
+    # Try endpoints in order: data-api (no geo-block) → main api → mirrors
+    API_ENDPOINTS = [
+        "https://data-api.binance.vision/api/v3/aggTrades",
+        "https://api.binance.com/api/v3/aggTrades",
+        "https://api1.binance.com/api/v3/aggTrades",
+    ]
+
+    # Find a working endpoint
+    base_url = None
+    clean_sym = symbol.replace("/", "")
+    for url in API_ENDPOINTS:
+        try:
+            test_resp = requests.get(url, params={"symbol": clean_sym, "limit": 1}, timeout=5)
+            if test_resp.status_code == 200:
+                base_url = url
+                break
+        except requests.RequestException:
+            continue
+
+    if base_url is None:
+        raise RuntimeError(
+            f"All Binance API endpoints are unreachable for {symbol}. "
+            "This can happen when running from a US-based server. "
+            "Try running the app locally instead."
+        )
+
     all_trades = []
     cursor = start_ms
     batch = 0
 
     while cursor < end_ms:
         params = {
-            "symbol": symbol.replace("/", ""),
+            "symbol": clean_sym,
             "startTime": cursor,
             "endTime": min(cursor + 3_600_000, end_ms),
             "limit": 1000,
