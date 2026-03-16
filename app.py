@@ -65,9 +65,13 @@ with st.sidebar:
         "Binance Futures Maker (0.02%/leg)": "futures-maker",
         "Bybit Futures Maker (0.01%/leg)": "bybit-maker",
     }
-    fee_label = st.selectbox("Fee Profile", list(fee_options.keys()), index=1)
+    fee_label = st.selectbox("Fee Profile", list(fee_options.keys()), index=3)
     fee_key = fee_options[fee_label]
     fee_profile = FEE_MAP[fee_key]
+
+    latency_ms = st.number_input("Execution Latency (ms)", min_value=0, max_value=5000, value=1000, step=100,
+                                    help="API latency before trade entry. Data resolution is 1s, "
+                                         "so values are rounded to the nearest second.")
 
     skip_optuna = st.checkbox("Skip Optuna optimization", value=False,
                               help="Optuna finds the best strategy parameters for this coin. "
@@ -136,6 +140,8 @@ if run_clicked:
     follower_symbol = f"{coin}USDT"
     leader_symbol = "BTCUSDT"
 
+    exec_delay_s = max(0, round(latency_ms / 1000))
+
     # Fallback params (used when Optuna is skipped)
     fallback_params = StrategyParams(
         btc_window_s=btc_window,
@@ -145,6 +151,7 @@ if run_clicked:
         max_hold_s=max_hold,
         cooldown_s=cooldown,
         min_volume_ratio=vol_ratio,
+        execution_delay_s=exec_delay_s,
     )
 
     end_date = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -185,6 +192,7 @@ if run_clicked:
                 max_hold_s=best_params["max_hold_s"],
                 cooldown_s=best_params["cooldown_s"],
                 min_volume_ratio=best_params["min_volume_ratio"],
+                execution_delay_s=exec_delay_s,
             )
             params_source = "optuna"
             st.write(f"  Best score: {opt_summary['best_score']:.4f}")
