@@ -27,6 +27,7 @@ import regime as regime_mod
 import risk as risk_mod
 import correlation as correlation_mod
 import walkforward as wf_mod
+import history as history_mod
 
 # Redirect all module consoles to buffer
 data_mod.console = _quiet_console
@@ -105,14 +106,22 @@ with st.sidebar:
     st.divider()
     run_clicked = st.button("Run Analysis", type="primary", use_container_width=True)
 
+    # Cache info
+    cache_info = data_mod.get_cache_summary()
+    if cache_info["files"] > 0:
+        with st.expander("Cache Info"):
+            st.caption(f"{cache_info['files']} cached day-files ({cache_info['size_mb']:.1f} MB)")
+            if cache_info["symbols"]:
+                st.caption(f"Symbols: {', '.join(cache_info['symbols'])}")
+
 
 # ── Cached data loader ────────────────────────────────────────────
-@st.cache_data(show_spinner=False, ttl=3600)
+@st.cache_data(show_spinner=False)
 def _load_pair_cached(leader: str, follower: str, start_iso: str, days: int):
     """Cache tick data so repeat runs with same coin/period are instant.
 
     Uses start_iso (string) instead of datetime for cache-key hashability.
-    TTL=3600s (1 hour) keeps data fresh without re-fetching every click.
+    Disk cache (.tick_cache/) is the real persistence layer; this avoids re-reading.
     """
     start_date = datetime.fromisoformat(start_iso)
     ts, l_p, l_v, f_p, f_v = data_mod.load_aligned_pair(
@@ -183,11 +192,23 @@ if run_clicked:
         st.write(f"Step 1/{n_steps}: Loading tick data...")
         _buf.truncate(0)
         _buf.seek(0)
+        data_mod.clear_fetch_status()
         ts, btc_p, btc_v, f_p, f_v = _load_pair_cached(
             leader_symbol.replace("USDT", "/USDT"),
             follower_symbol.replace("USDT", "/USDT"),
             start_date.isoformat(), days,
         )
+        # Show cache status
+        fetch_st = data_mod.get_fetch_status()
+        cached_n = sum(1 for v in fetch_st.values() if v == "cached")
+        dl_n = sum(1 for v in fetch_st.values() if v == "downloaded")
+        if fetch_st:
+            if dl_n == 0:
+                st.write(f"  All {cached_n} day-segments loaded from cache")
+            elif cached_n == 0:
+                st.write(f"  Downloaded {dl_n} day-segments from Binance")
+            else:
+                st.write(f"  {cached_n} from cache, {dl_n} freshly downloaded")
         st.write(f"  Aligned: {len(ts):,} seconds ({len(ts)/3600:.1f} hours)")
 
         # Step 2: Optuna optimization (finds optimal params)
@@ -411,6 +432,9 @@ if run_clicked:
         },
     )
 
+    # Auto-save full analysis to history for cross-run comparison
+    history_mod.save_analysis_run(st.session_state.results)
+
 
 # ── Display Results ───────────────────────────────────────────────
 if "results" not in st.session_state:
@@ -433,8 +457,8 @@ st.caption(f"{res['meta']['start_date']} to {res['meta']['end_date']} ({res['met
            f"Params: {source_label}")
 
 # ── Tabs ──────────────────────────────────────────────────────────
-tab_overview, tab_structure, tab_strategy, tab_baseline, tab_regime, tab_risk, tab_optuna = st.tabs(
-    ["Overview", "Market Structure", "Strategy", "Baseline", "Regime", "Risk", "Optuna"]
+tab_overview, tab_structure, tab_strategy, tab_baseline, tab_regime, tab_risk, tab_optuna, tab_history = st.tabs(
+    ["Overview", "Market Structure", "Strategy", "Baseline", "Regime", "Risk", "Optuna", "History"]
 )
 
 # ── Tab 1: Overview ───────────────────────────────────────────────
@@ -1047,23 +1071,7 @@ st.divider()
 dcol1, dcol2 = st.columns(2)
 
 with dcol1:
-    # Serialize results for download (exclude non-serializable objects)
-    def _serialize(obj):
-        if hasattr(obj, "__dataclass_fields__"):
-            return {k: _serialize(v) for k, v in obj.__dict__.items()}
-        if isinstance(obj, (np.integer,)):
-            return int(obj)
-        if isinstance(obj, (np.floating, np.float64)):
-            return float(obj)
-        if isinstance(obj, np.ndarray):
-            return obj.tolist()
-        if isinstance(obj, list):
-            return [_serialize(i) for i in obj]
-        if isinstance(obj, dict):
-            return {str(k): _serialize(v) for k, v in obj.items()}
-        return obj
-
-    json_str = json.dumps(_serialize(res), indent=2, default=str)
+    json_str = json.dumps(history_mod.serialize(res), indent=2, default=str)
     st.download_button(
         "Download Results (JSON)",
         json_str,
@@ -1085,3 +1093,59 @@ with dcol2:
             )
     except Exception as e:
         st.caption(f"PDF generation unavailable: {e}")
+
+# ── Tab 8: History ────────────────────────────────────────────────
+with tab_history:
+    st.subheader("Analysis History")
+    st.caption("Results are auto-saved after each run. Compare coins and strategies across analyses.")
+
+    history = history_mod.load_analysis_history()
+
+    if not history:
+        st.info("No saved analyses yet. Run an analysis to start building history.")
+    else:
+        # Filter by coin
+        coins_in_hist = sorted(set(
+            e.get("meta", {}).get("coin", "?") for e in history.values()
+        ))
+        filter_coins = st.multiselect(
+            "Filter by coin", coins_in_hist, default=coins_in_hist,
+            key="history_coin_filter",
+        )
+
+        comp_df = history_mod.get_comparison_dataframe(history, filter_coins=filter_coins)
+
+        if comp_df.empty:
+            st.info("No matching analyses for selected coins.")
+        else:
+            # Style: color-code win rate and total net
+            def _color_val(val):
+                if isinstance(val, (int, float)) and not pd.isna(val):
+                    if val > 0:
+                        return "color: green"
+                    elif val < 0:
+                        return "color: red"
+                return ""
+
+            display_df = comp_df.drop(columns=["Run ID"])
+            styled = display_df.style.map(
+                _color_val, subset=["Avg Net %", "Total Net %"]
+            )
+            st.dataframe(styled, use_container_width=True, height=400)
+
+            st.caption(f"{len(comp_df)} analyses saved")
+
+        # Manage history
+        with st.expander("Manage History"):
+            run_ids = list(history.keys())
+            del_id = st.selectbox("Select run to delete", run_ids, key="del_run_id")
+            col_del1, col_del2 = st.columns(2)
+            with col_del1:
+                if st.button("Delete Selected"):
+                    history_mod.delete_analysis_run(del_id)
+                    st.rerun()
+            with col_del2:
+                if st.button("Clear All History"):
+                    for rid in list(history.keys()):
+                        history_mod.delete_analysis_run(rid)
+                    st.rerun()

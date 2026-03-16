@@ -15,9 +15,44 @@ from rich.console import Console
 
 console = Console()
 
-# Cache: prefer shared cache with xrp-btc-analyzer, fall back to local
-_shared = Path(__file__).parent.parent / "xrp-btc-analyzer" / ".tick_cache"
-CACHE_DIR = _shared if _shared.exists() else Path(__file__).parent / ".tick_cache"
+# Always use local cache (shared path doesn't exist on Streamlit Cloud)
+CACHE_DIR = Path(__file__).parent / ".tick_cache"
+
+# Track cache hits vs downloads per fetch call
+_fetch_status: dict[str, str] = {}  # key -> "cached" | "downloaded"
+
+
+def get_fetch_status() -> dict[str, str]:
+    """Return cache hit/miss status for recent fetches."""
+    return dict(_fetch_status)
+
+
+def clear_fetch_status():
+    """Reset status tracker (call before each pipeline run)."""
+    _fetch_status.clear()
+
+
+def get_cache_summary(cache_dir: Path = None) -> dict:
+    """Return cache statistics: file count, total size, symbols covered."""
+    cache = cache_dir or CACHE_DIR
+    if not cache.exists():
+        return {"files": 0, "size_mb": 0.0, "symbols": []}
+
+    files = list(cache.glob("*.json.gz"))
+    total_size = sum(f.stat().st_size for f in files)
+    symbols = set()
+    for f in files:
+        parts = f.stem.replace(".json", "").split("_")
+        if len(parts) >= 4:
+            symbols.add(f"{parts[0]}_{parts[1]}")  # e.g. "BTC_USDT"
+        elif len(parts) >= 3:
+            symbols.add(parts[0])
+
+    return {
+        "files": len(files),
+        "size_mb": round(total_size / 1024 / 1024, 1),
+        "symbols": sorted(symbols),
+    }
 
 
 def fetch_agg_trades(symbol: str, start_ms: int, end_ms: int,
@@ -31,11 +66,15 @@ def fetch_agg_trades(symbol: str, start_ms: int, end_ms: int,
 
     cache_file = cache / f"{symbol.replace('/', '_')}_{start_ms}_{end_ms}.json.gz"
 
+    cache_key = f"{symbol.replace('/', '_')}_{start_ms}"
+
     if cache_file.exists():
+        _fetch_status[cache_key] = "cached"
         console.print(f"  [dim]Loading {symbol} from cache...[/]")
         with gzip.open(cache_file, "rt") as f:
             return json.load(f)
 
+    _fetch_status[cache_key] = "downloaded"
     console.print(f"  Fetching {symbol} aggTrades...")
 
     # Try endpoints in order: data-api (no geo-block) → main api → mirrors
