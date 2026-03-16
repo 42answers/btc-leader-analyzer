@@ -60,6 +60,7 @@ def simulate_tpsl_strategy(
     vol_burst = max(1, int(params.vol_burst_s / bin_s))
 
     fee_rt_pct = fee_profile.fee_per_leg * fee_profile.legs_per_trade * 100
+    slip = params.slippage_bps / 10_000
 
     trades = []
     last_trade_idx = -cooldown_bins
@@ -95,10 +96,21 @@ def simulate_tpsl_strategy(
 
         entry_price = follower_prices[entry_idx]
 
-        if direction == "LONG":
-            follower_return = (exit_price - entry_price) / entry_price * 100
+        # Apply slippage: worse fill on both legs
+        if slip > 0:
+            if direction == "LONG":
+                entry_adj = entry_price * (1 + slip)
+                exit_adj = exit_price * (1 - slip)
+            else:
+                entry_adj = entry_price * (1 - slip)
+                exit_adj = exit_price * (1 + slip)
         else:
-            follower_return = (entry_price - exit_price) / entry_price * 100
+            entry_adj, exit_adj = entry_price, exit_price
+
+        if direction == "LONG":
+            follower_return = (exit_adj - entry_adj) / entry_adj * 100
+        else:
+            follower_return = (entry_adj - exit_adj) / entry_adj * 100
 
         gross_pnl = follower_return * leverage
         net_pnl = gross_pnl - fee_rt_pct

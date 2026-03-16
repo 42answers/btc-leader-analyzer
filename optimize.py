@@ -19,6 +19,7 @@ def optimize_parameters(
     leverage: float = 1.0,
     n_trials: int = 300,
     seed: int = 42,
+    slippage_bps: float = 0.0,
 ) -> tuple[dict, dict]:
     """Run Optuna Bayesian optimization for TP/SL strategy parameters.
 
@@ -30,6 +31,7 @@ def optimize_parameters(
     bin_s = btc_ts[1] - btc_ts[0] if len(btc_ts) > 1 else 1.0
     n = min(len(btc_prices), len(follower_prices))
     fee_rt_pct = fee_profile.fee_per_leg * fee_profile.legs_per_trade * 100
+    slip = slippage_bps / 10_000
 
     def objective(trial):
         btc_window_s = trial.suggest_float("btc_window_s", 3, 300, log=True)
@@ -85,10 +87,21 @@ def optimize_parameters(
                     exit_price = follower_prices[j]
                     break
 
-            if direction == "LONG":
-                follower_ret = (exit_price - entry_price) / entry_price * 100
+            # Apply slippage
+            if slip > 0:
+                if direction == "LONG":
+                    entry_adj = entry_price * (1 + slip)
+                    exit_adj = exit_price * (1 - slip)
+                else:
+                    entry_adj = entry_price * (1 - slip)
+                    exit_adj = exit_price * (1 + slip)
             else:
-                follower_ret = (entry_price - exit_price) / entry_price * 100
+                entry_adj, exit_adj = entry_price, exit_price
+
+            if direction == "LONG":
+                follower_ret = (exit_adj - entry_adj) / entry_adj * 100
+            else:
+                follower_ret = (entry_adj - exit_adj) / entry_adj * 100
 
             net = follower_ret * leverage - fee_rt_pct
             trades_net.append(net)

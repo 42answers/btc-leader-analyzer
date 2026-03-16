@@ -26,6 +26,7 @@ import baseline as baseline_mod
 import regime as regime_mod
 import risk as risk_mod
 import correlation as correlation_mod
+import walkforward as wf_mod
 
 # Redirect all module consoles to buffer
 data_mod.console = _quiet_console
@@ -72,9 +73,19 @@ with st.sidebar:
     exec_delay_s = st.number_input("Execution Latency (s)", min_value=0, max_value=5, value=1, step=1,
                                     help="Seconds of API latency before trade entry (data resolution is 1s).")
 
+    slippage_bps = st.number_input("Slippage (bps/leg)", min_value=0, max_value=20, value=2, step=1,
+                                    help="Market impact per leg in basis points. "
+                                         "2 bps is conservative for liquid futures. "
+                                         "Set to 0 for ideal (no slippage).")
+
     skip_optuna = st.checkbox("Skip Optuna optimization", value=False,
                               help="Optuna finds the best strategy parameters for this coin. "
                                    "Takes 2-5 min. Without it, fallback defaults are used.")
+
+    run_walkforward = st.checkbox("Walk-forward validation", value=False,
+                                   help="Split data into train/test folds. Optimizes on train, tests on unseen data. "
+                                        "Proves whether the edge survives out-of-sample. Requires Optuna enabled. "
+                                        "Adds 5-15 min depending on data size.")
 
     with st.expander("Fallback / Manual Parameters", expanded=False):
         st.caption("These are only used when Optuna is skipped. "
@@ -141,6 +152,8 @@ if run_clicked:
 
     exec_delay_s = max(0, int(exec_delay_s))
 
+    slippage_bps_val = float(slippage_bps)
+
     # Fallback params (used when Optuna is skipped)
     fallback_params = StrategyParams(
         btc_window_s=btc_window,
@@ -151,12 +164,19 @@ if run_clicked:
         cooldown_s=cooldown,
         min_volume_ratio=vol_ratio,
         execution_delay_s=exec_delay_s,
+        slippage_bps=slippage_bps_val,
     )
 
     end_date = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     start_date = end_date - timedelta(days=days)
 
-    n_steps = 8 if not skip_optuna else 7
+    n_steps = 7  # base steps (data, optuna/skip, impulse, market, strategy, baseline, regime, risk... but counted as 7 below)
+    if not skip_optuna:
+        n_steps = 8
+    if not skip_optuna:
+        n_steps += 1  # OOS test
+    if run_walkforward and not skip_optuna:
+        n_steps += 1  # walk-forward
 
     with st.status(f"Analyzing {coin}/BTC over {days} days...", expanded=True):
         # Step 1: Load data
@@ -179,6 +199,7 @@ if run_clicked:
             best_params, opt_summary = optimize_parameters(
                 ts, btc_p, btc_v, ts, f_p, f_v,
                 fee_profile, leverage=1.0, n_trials=300,
+                slippage_bps=slippage_bps_val,
             )
             optuna_result = {"best_params": best_params, "summary": opt_summary}
 
@@ -192,6 +213,7 @@ if run_clicked:
                 cooldown_s=best_params["cooldown_s"],
                 min_volume_ratio=best_params["min_volume_ratio"],
                 execution_delay_s=exec_delay_s,
+                slippage_bps=slippage_bps_val,
             )
             params_source = "optuna"
             st.write(f"  Best score: {opt_summary['best_score']:.4f}")
@@ -256,7 +278,7 @@ if run_clicked:
         regime_sum = regime_mod.regime_summary(regimes)
         step += 1
 
-        # Step 8: Risk Monte Carlo
+        # Risk Monte Carlo
         st.write(f"Step {step}/{n_steps}: Risk Monte Carlo (10k permutations)...")
         risk_result = risk_mod.risk_profile_monte_carlo(
             strategy_trades,
@@ -265,6 +287,64 @@ if run_clicked:
             initial_capital=capital,
             fee_rt_pct=fee_profile.round_trip_pct,
         )
+        step += 1
+
+        # Out-of-sample test (run Optuna params on preceding period)
+        oos_result_data = None
+        if not skip_optuna:
+            oos_days = min(days, 14)  # match analysis length or cap at 14
+            oos_start = start_date - timedelta(days=oos_days)
+            st.write(f"Step {step}/{n_steps}: Out-of-sample test ({oos_days}d before analysis window)...")
+            try:
+                ts_oos, btc_oos, btcv_oos, f_oos, fv_oos = _load_pair_cached(
+                    leader_symbol.replace("USDT", "/USDT"),
+                    follower_symbol.replace("USDT", "/USDT"),
+                    oos_start.isoformat(), oos_days,
+                )
+                oos_strat = strategy_mod.simulate_tpsl_strategy(
+                    ts_oos, btc_oos, btcv_oos, ts_oos, f_oos, fv_oos,
+                    params, fee_profile, leverage=1.0,
+                )
+                oos_result_data = {
+                    "period": f"{oos_start.strftime('%Y-%m-%d')} to {start_date.strftime('%Y-%m-%d')}",
+                    "days": oos_days,
+                    "win_rate": oos_strat["win_rate"],
+                    "avg_net": oos_strat["avg_net_pct"],
+                    "total_return": oos_strat["total_net_pct"],
+                    "n_trades": oos_strat["total_trades"],
+                    "max_dd": oos_strat["max_drawdown_pct"],
+                }
+                st.write(f"  OOS: {oos_strat['total_trades']} trades, "
+                         f"{oos_strat['win_rate']:.1f}% WR, "
+                         f"{oos_strat['total_net_pct']:+.2f}% return")
+            except Exception as e:
+                st.write(f"  OOS data not available: {e}")
+            step += 1
+
+        # Walk-forward validation
+        wf_result_data = None
+        if run_walkforward and not skip_optuna:
+            train_d = max(7, days - 4)  # leave at least 4 days for test
+            test_d = min(4, days - 7)
+            if test_d < 2:
+                test_d = 2
+                train_d = days - test_d
+            st.write(f"Step {step}/{n_steps}: Walk-forward validation "
+                     f"(train={train_d}d, test={test_d}d)...")
+            wf_result_data = wf_mod.run_walk_forward(
+                leader_symbol.replace("USDT", "/USDT"),
+                follower_symbol.replace("USDT", "/USDT"),
+                start_date, days,
+                train_days=train_d, test_days=test_d,
+                fee_profile=fee_profile,
+                slippage_bps=slippage_bps_val,
+                exec_delay_s=exec_delay_s,
+                n_trials=150,
+                load_fn=_load_pair_cached,
+            )
+            st.write(f"  {wf_result_data['n_folds']} folds | "
+                     f"OOS avg net: {wf_result_data['aggregate_oos']['avg_net']:+.4f}% | "
+                     f"Degradation: {wf_result_data['degradation_pct']:.0f}%")
 
     # Store in session state
     st.session_state.results = {
@@ -280,6 +360,7 @@ if run_clicked:
             "params_source": params_source,
             "fee_profile": fee_profile.name,
             "fee_rt_pct": fee_profile.round_trip_pct,
+            "slippage_bps": slippage_bps_val,
         },
         "impulse_summary": impulse_summary,
         "strategy": {k: v for k, v in strat_result.items() if k != "trades"},
@@ -291,6 +372,10 @@ if run_clicked:
     }
     if optuna_result:
         st.session_state.results["optuna"] = optuna_result["summary"]
+    if oos_result_data:
+        st.session_state.results["oos"] = oos_result_data
+    if wf_result_data:
+        st.session_state.results["walkforward"] = wf_result_data
 
     st.session_state.trades = strategy_trades
     st.session_state.regimes = regimes
@@ -342,8 +427,9 @@ regimes = st.session_state.regimes
 st.header(f"{coin}/BTC Catch-Up Trade Analysis")
 params_source = res['meta'].get('params_source', 'manual')
 source_label = "Optuna-optimized" if params_source == "optuna" else "Manual fallback"
+slip_label = f" | Slippage: {res['meta'].get('slippage_bps', 0):.0f} bps/leg" if res['meta'].get('slippage_bps', 0) > 0 else ""
 st.caption(f"{res['meta']['start_date']} to {res['meta']['end_date']} ({res['meta']['days']} days) | "
-           f"Fee: {res['meta']['fee_profile']} ({res['meta']['fee_rt_pct']:.2f}% r/t) | "
+           f"Fee: {res['meta']['fee_profile']} ({res['meta']['fee_rt_pct']:.2f}% r/t){slip_label} | "
            f"Params: {source_label}")
 
 # ── Tabs ──────────────────────────────────────────────────────────
@@ -705,6 +791,113 @@ with tab_strategy:
         st.bar_chart(exit_counts)
     else:
         st.warning("No trades generated with current parameters.")
+
+    # ── Out-of-Sample Validation ─────────────────────────────────
+    if "oos" in res:
+        st.divider()
+        st.subheader("Out-of-Sample Validation")
+        st.caption("Same Optuna parameters tested on data *before* the analysis window (unseen during optimization).")
+
+        oos = res["oos"]
+        oc1, oc2, oc3, oc4, oc5 = st.columns(5)
+        oc1.metric("OOS Trades", oos["n_trades"])
+        oc2.metric("OOS Win Rate", f"{oos['win_rate']:.1f}%")
+        oc3.metric("OOS Avg Net", f"{oos['avg_net']:+.4f}%")
+        oc4.metric("OOS Total Return", f"{oos['total_return']:+.2f}%")
+        oc5.metric("OOS Max DD", f"{oos['max_dd']:.1f}%")
+
+        # Side-by-side comparison
+        comp_data = {
+            "Metric": ["Win Rate", "Avg Net/Trade", "Total Return", "Trades", "Max DD"],
+            "In-Sample": [
+                f"{strat['win_rate']:.1f}%",
+                f"{strat['avg_net_pct']:+.4f}%",
+                f"{strat['total_net_pct']:+.2f}%",
+                str(strat["total_trades"]),
+                f"{strat['max_drawdown_pct']:.1f}%",
+            ],
+            f"Out-of-Sample ({oos['days']}d)": [
+                f"{oos['win_rate']:.1f}%",
+                f"{oos['avg_net']:+.4f}%",
+                f"{oos['total_return']:+.2f}%",
+                str(oos["n_trades"]),
+                f"{oos['max_dd']:.1f}%",
+            ],
+        }
+        st.table(pd.DataFrame(comp_data))
+
+        # Edge retention assessment
+        if strat["avg_net_pct"] > 0 and oos["avg_net"] > 0:
+            retention = oos["avg_net"] / strat["avg_net_pct"] * 100
+            if retention >= 50:
+                st.success(f"Edge retained: OOS keeps {retention:.0f}% of in-sample edge. The signal appears robust.")
+            elif retention >= 25:
+                st.warning(f"Partial edge: OOS retains {retention:.0f}% of in-sample edge. Some overfitting likely.")
+            else:
+                st.error(f"Weak OOS: Only {retention:.0f}% of in-sample edge survives. Heavy overfitting suspected.")
+        elif strat["avg_net_pct"] > 0 and oos["avg_net"] <= 0:
+            st.error("Edge lost: OOS shows negative returns. In-sample results are likely overfitted.")
+        elif oos["n_trades"] == 0:
+            st.warning("No OOS trades — parameters may be too restrictive for different market conditions.")
+
+    # ── Walk-Forward Validation ──────────────────────────────────
+    if "walkforward" in res:
+        st.divider()
+        st.subheader("Walk-Forward Validation")
+        st.caption("Rolling train/test: optimize on train window, test on unseen test window, roll forward.")
+
+        wf = res["walkforward"]
+
+        wc1, wc2, wc3, wc4 = st.columns(4)
+        wc1.metric("Folds", wf["n_folds"])
+        wc2.metric("OOS Win Rate", f"{wf['aggregate_oos']['win_rate']:.1f}%")
+        wc3.metric("OOS Avg Net", f"{wf['aggregate_oos']['avg_net']:+.4f}%")
+        wc4.metric("Degradation", f"{wf['degradation_pct']:.0f}%",
+                    help="How much worse OOS is vs in-sample (lower = better)")
+
+        # Fold detail table
+        fold_rows = []
+        for f in wf["folds"]:
+            if "error" in f:
+                fold_rows.append({
+                    "Fold": f["fold"],
+                    "Train": f["train_range"],
+                    "Test": f["test_range"],
+                    "IS WR": "—",
+                    "OOS WR": f"Error: {f['error']}",
+                    "IS Avg Net": "—",
+                    "OOS Avg Net": "—",
+                    "IS Trades": "—",
+                    "OOS Trades": "—",
+                })
+            else:
+                fold_rows.append({
+                    "Fold": f["fold"],
+                    "Train": f["train_range"],
+                    "Test": f["test_range"],
+                    "IS WR": f"{f['in_sample']['win_rate']:.1f}%",
+                    "OOS WR": f"{f['out_of_sample']['win_rate']:.1f}%",
+                    "IS Avg Net": f"{f['in_sample']['avg_net']:+.4f}%",
+                    "OOS Avg Net": f"{f['out_of_sample']['avg_net']:+.4f}%",
+                    "IS Trades": f['in_sample']['n_trades'],
+                    "OOS Trades": f['out_of_sample']['n_trades'],
+                })
+
+        if fold_rows:
+            st.dataframe(pd.DataFrame(fold_rows), use_container_width=True)
+
+        # Assessment
+        deg = wf["degradation_pct"]
+        oos_avg = wf["aggregate_oos"]["avg_net"]
+        if oos_avg > 0 and deg < 50:
+            st.success(f"Walk-forward positive: OOS avg net {oos_avg:+.4f}% with {deg:.0f}% degradation. "
+                       "Edge appears real and tradeable.")
+        elif oos_avg > 0:
+            st.warning(f"Walk-forward marginal: OOS avg net {oos_avg:+.4f}% but {deg:.0f}% degradation. "
+                       "Edge exists but is weaker than in-sample suggests.")
+        else:
+            st.error(f"Walk-forward negative: OOS avg net {oos_avg:+.4f}%. "
+                     "In-sample results are likely overfitted to the specific time period.")
 
 # ── Tab 3: Baseline ───────────────────────────────────────────────
 with tab_baseline:

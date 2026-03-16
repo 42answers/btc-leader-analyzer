@@ -22,6 +22,7 @@ def _simulate_random_entries(
     max_hold_bins = max(1, int(params.max_hold_s / bin_s))
     cooldown_bins = max(1, int(params.cooldown_s / bin_s))
     fee_rt_pct = fee_profile.fee_per_leg * fee_profile.legs_per_trade * 100
+    slip = params.slippage_bps / 10_000
 
     # Generate random entry points with cooldown spacing
     margin = max_hold_bins + params.execution_delay_s + 10
@@ -66,10 +67,21 @@ def _simulate_random_entries(
         else:
             exit_price = follower_prices[end_idx]
 
-        if direction == "LONG":
-            follower_return = (exit_price - entry_price) / entry_price * 100
+        # Apply slippage
+        if slip > 0:
+            if direction == "LONG":
+                entry_adj = entry_price * (1 + slip)
+                exit_adj = exit_price * (1 - slip)
+            else:
+                entry_adj = entry_price * (1 - slip)
+                exit_adj = exit_price * (1 + slip)
         else:
-            follower_return = (entry_price - exit_price) / entry_price * 100
+            entry_adj, exit_adj = entry_price, exit_price
+
+        if direction == "LONG":
+            follower_return = (exit_adj - entry_adj) / entry_adj * 100
+        else:
+            follower_return = (entry_adj - exit_adj) / entry_adj * 100
 
         net_pnl = follower_return * leverage - fee_rt_pct
         net_pnls.append(net_pnl)

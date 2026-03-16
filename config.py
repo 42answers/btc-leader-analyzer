@@ -43,6 +43,7 @@ class StrategyParams:
     max_hold_s: float = 600         # Maximum hold time before forced exit
     cooldown_s: float = 60          # Min time between trades
     execution_delay_s: int = 1      # API execution latency (seconds/bins)
+    slippage_bps: float = 0.0      # Slippage per leg in basis points
     min_volume_ratio: float = 1.0   # Volume burst filter (1.0 = disabled)
     vol_baseline_s: int = 120       # Volume baseline window
     vol_burst_s: int = 5            # Volume burst window
