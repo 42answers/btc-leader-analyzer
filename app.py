@@ -224,45 +224,105 @@ if run_clicked:
         # ── Suitability pre-check: multi-timescale correlation ────
         st.write(f"Step 2/{n_steps}: Suitability check (multi-timescale correlation)...")
         from scipy.stats import pearsonr
-        suit_results = {}
-        for resample_s in [1, 10, 60, 300]:
+
+        # Pass 1: coarse scan to find the region where correlation appears
+        coarse_scales = [1, 5, 10, 30, 60, 120, 300]
+        all_corrs = {}
+        for resample_s in coarse_scales:
             step_size = max(1, resample_s)
             btc_ret = np.diff(btc_p[::step_size]) / btc_p[::step_size][:-1]
             fol_ret = np.diff(f_p[::step_size]) / f_p[::step_size][:-1]
             n_r = min(len(btc_ret), len(fol_ret))
             if n_r > 30:
                 r, _ = pearsonr(btc_ret[:n_r], fol_ret[:n_r])
-                suit_results[resample_s] = round(r, 3)
+                all_corrs[resample_s] = round(r, 4)
             else:
-                suit_results[resample_s] = 0.0
+                all_corrs[resample_s] = 0.0
 
-        # Find the best timescale
-        best_ts = max(suit_results, key=suit_results.get)
-        best_r = suit_results[best_ts]
-        labels = {1: "1s", 10: "10s", 60: "1min", 300: "5min"}
-        corr_parts = [f"{labels[k]}={v:.3f}" for k, v in suit_results.items()]
+        # Pass 2: zoom in around the transition zone (where r crosses 0.1)
+        # Find the two coarse scales that bracket the 0.1 threshold
+        sorted_scales = sorted(all_corrs.keys())
+        for i in range(len(sorted_scales) - 1):
+            lo_s, hi_s = sorted_scales[i], sorted_scales[i + 1]
+            lo_r, hi_r = all_corrs[lo_s], all_corrs[hi_s]
+            if lo_r < 0.08 and hi_r >= 0.08 and hi_s - lo_s > 2:
+                # Zoom: test intermediate scales in this gap
+                if hi_s <= 10:
+                    zoom_scales = range(lo_s + 1, hi_s)
+                elif hi_s <= 30:
+                    zoom_scales = range(lo_s + 2, hi_s, 2)
+                else:
+                    zoom_scales = range(lo_s + 5, hi_s, 5)
+                for zs in zoom_scales:
+                    step_size = max(1, zs)
+                    btc_ret = np.diff(btc_p[::step_size]) / btc_p[::step_size][:-1]
+                    fol_ret = np.diff(f_p[::step_size]) / f_p[::step_size][:-1]
+                    n_r = min(len(btc_ret), len(fol_ret))
+                    if n_r > 30:
+                        r, _ = pearsonr(btc_ret[:n_r], fol_ret[:n_r])
+                        all_corrs[zs] = round(r, 4)
+                break  # only zoom into the first transition
+
+        # Build display: show coarse scales + zoomed detail
+        suit_results = all_corrs  # full resolution for Optuna constraints
+
+        # For display, pick key scales: always show 1s, the onset, peak, and some context
+        display_scales = sorted(all_corrs.keys())
+        best_ts = max(all_corrs, key=all_corrs.get)
+        best_r = all_corrs[best_ts]
+
+        # Find onset: smallest scale where r >= 0.1
+        onset_s = None
+        for s in display_scales:
+            if all_corrs[s] >= 0.1:
+                onset_s = s
+                break
+
+        def _label(s):
+            if s >= 60:
+                return f"{s // 60}min"
+            return f"{s}s"
+
+        corr_parts = [f"{_label(k)}={all_corrs[k]:.3f}" for k in display_scales]
         st.write(f"  Pearson r: {' | '.join(corr_parts)}")
+        if onset_s and onset_s > 1:
+            st.write(f"  Signal onset: **{_label(onset_s)}** (r crosses 0.1)")
 
-        # Store for display in overview
-        suitability = {"correlations": suit_results, "best_timescale": best_ts, "best_r": best_r}
+        # Store for display in overview — keep only key scales for clean UI
+        display_keys = [1]
+        if onset_s and onset_s not in display_keys:
+            display_keys.append(onset_s)
+        for s in [10, 30, 60, 300]:
+            if s not in display_keys and s in all_corrs:
+                display_keys.append(s)
+        display_keys = sorted(set(display_keys))
+        display_corrs = {k: all_corrs[k] for k in display_keys if k in all_corrs}
+
+        suitability = {
+            "correlations": display_corrs,
+            "all_correlations": all_corrs,
+            "best_timescale": best_ts,
+            "best_r": best_r,
+            "onset_s": onset_s,
+        }
 
         if best_r < 0.05:
             st.error(f"⚠️ {coin} shows near-zero correlation with BTC at all timescales. "
                      f"The catch-up trade thesis does not apply to this coin. "
                      f"Results below will likely be noise/overfitting.")
-        elif suit_results.get(1, 0) < 0.1 and best_r >= 0.1:
-            st.warning(f"⚠️ {coin} follows BTC at {labels[best_ts]} ({best_r:.3f}) but NOT at 1s ({suit_results[1]:.3f}). "
-                       f"The catch-up signal exists but needs time to propagate. "
-                       f"Strategy windows <{best_ts}s will mostly trade noise.")
-        elif suit_results.get(1, 0) >= 0.1:
-            st.success(f"✅ {coin} follows BTC even at 1s ({suit_results[1]:.3f}). "
-                       f"Strongest at {labels[best_ts]} ({best_r:.3f}). Suitable for catch-up trading.")
+        elif all_corrs.get(1, 0) < 0.1 and best_r >= 0.1:
+            st.warning(f"⚠️ {coin} follows BTC from {_label(onset_s or best_ts)} ({all_corrs.get(onset_s or best_ts, best_r):.3f}) "
+                       f"but NOT at 1s ({all_corrs.get(1, 0):.3f}). "
+                       f"Strategy windows below {_label(onset_s or best_ts)} will mostly trade noise.")
+        elif all_corrs.get(1, 0) >= 0.1:
+            st.success(f"✅ {coin} follows BTC even at 1s ({all_corrs[1]:.3f}). "
+                       f"Strongest at {_label(best_ts)} ({best_r:.3f}). Suitable for catch-up trading.")
 
         # ── Derive Optuna constraints from data ─────────────────────
         # 1) Min window: smallest timescale where Pearson r >= 0.1
         min_window_from_suit = 5.0
-        for ts_scale in [1, 10, 60, 300]:
-            if suit_results.get(ts_scale, 0) >= 0.1:
+        for ts_scale in sorted(all_corrs.keys()):
+            if all_corrs[ts_scale] >= 0.1:
                 min_window_from_suit = float(ts_scale)
                 break
 
@@ -594,16 +654,20 @@ with tab_overview:
     # ── Suitability indicator ────────────────────────────────────
     suit = res.get("suitability")
     if suit:
-        labels = {1: "1s", 10: "10s", 60: "1min", 300: "5min"}
+        def _lbl(s):
+            return f"{s // 60}min" if s >= 60 else f"{s}s"
+
         corrs = suit["correlations"]
         best_ts = suit["best_timescale"]
         best_r = suit["best_r"]
-        corr_str = " → ".join(f"**{labels[k]}** {v:.3f}" for k, v in sorted(corrs.items()))
+        onset_s = suit.get("onset_s")
+        corr_str = " → ".join(f"**{_lbl(k)}** {v:.3f}" for k, v in sorted(corrs.items()))
         if best_r < 0.05:
             st.error(f"🚫 **Not suitable for catch-up trading.** Correlation: {corr_str}")
         elif corrs.get(1, 0) < 0.1 and best_r >= 0.1:
-            st.warning(f"⚠️ **Weak at 1s, stronger at {labels[best_ts]}.** Correlation: {corr_str}. "
-                       f"Strategy windows below {best_ts}s will mostly trade noise.")
+            onset_label = _lbl(onset_s) if onset_s else _lbl(best_ts)
+            st.warning(f"⚠️ **Signal onset at {onset_label}.** Correlation: {corr_str}. "
+                       f"Strategy windows below {onset_label} will mostly trade noise.")
         else:
             st.success(f"✅ **Good BTC follower.** Correlation: {corr_str}")
 
@@ -728,22 +792,30 @@ with tab_structure:
     corr = res["correlation"]
     suit_ms = res.get("suitability", {})
 
+    def _ms_label(s):
+        return f"{s // 60}min" if s >= 60 else f"{s}s"
+
     # ── Section 0: Multi-timescale correlation ──────────────────
     if suit_ms and "correlations" in suit_ms:
         st.subheader("Multi-Timescale Correlation")
         st.caption("Pearson r at different return intervals. The strategy operates at 1s but the catch-up signal plays out over longer scales.")
 
-        ts_labels = {1: "1s", 10: "10s", 60: "1min", 300: "5min"}
         ts_corrs = suit_ms["correlations"]
-        ms_cols = st.columns(len(ts_corrs))
-        for i, (scale, r_val) in enumerate(sorted(ts_corrs.items())):
-            ms_cols[i].metric(f"Pearson ({ts_labels[scale]})", f"{r_val:.3f}")
+        # Cap at 6 columns to avoid tiny metrics
+        sorted_scales = sorted(ts_corrs.keys())
+        if len(sorted_scales) > 6:
+            sorted_scales = sorted_scales[:6]
+        ms_cols = st.columns(len(sorted_scales))
+        for i, scale in enumerate(sorted_scales):
+            ms_cols[i].metric(f"Pearson ({_ms_label(scale)})", f"{ts_corrs[scale]:.3f}")
 
         best_scale = suit_ms.get("best_timescale", 1)
         best_r_val = suit_ms.get("best_r", 0)
-        if best_scale > 1 and ts_corrs.get(1, 0) < 0.1:
-            st.info(f"Correlation kicks in at **{ts_labels[best_scale]}** ({best_r_val:.3f}). "
-                    f"The 1s metrics below are noise-dominated — focus on the {ts_labels[best_scale]} scale for this coin.")
+        onset_s_ms = suit_ms.get("onset_s")
+        if onset_s_ms and onset_s_ms > 1 and ts_corrs.get(1, 0) < 0.1:
+            st.info(f"Signal onset at **{_ms_label(onset_s_ms)}** (r ≥ 0.1). "
+                    f"Peak at **{_ms_label(best_scale)}** ({best_r_val:.3f}). "
+                    f"The 1s metrics below are noise-dominated.")
 
         st.divider()
 
@@ -766,7 +838,7 @@ with tab_structure:
     elif p > 0.2:
         st.warning(f"Weak correlation ({p:.3f}): {coin} shows limited coupling to BTC at the 1-second level.")
     elif best_scale_s > 1 and suit_ms.get("best_r", 0) > 0.1:
-        st.warning(f"Near-zero at 1s ({p:.3f}) but correlates at {ts_labels.get(best_scale_s, '?')} "
+        st.warning(f"Near-zero at 1s ({p:.3f}) but correlates at {_ms_label(best_scale_s)} "
                    f"({suit_ms['best_r']:.3f}). Catch-up is slow — the signal needs time to propagate.")
     else:
         st.error(f"Very weak correlation ({p:.3f}): {coin} moves largely independently from BTC.")
