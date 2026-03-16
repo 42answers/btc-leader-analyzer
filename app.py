@@ -777,7 +777,7 @@ with tab_strategy:
 
         # Color the Result column
         st.dataframe(
-            df.style.applymap(
+            df.style.map(
                 lambda v: "color: green" if v == "WIN" else "color: red" if v == "LOSS" else "",
                 subset=["Result"]
             ),
@@ -969,7 +969,7 @@ with tab_regime:
             "BTC Return %": round(rg.btc_return_pct, 2),
             f"{coin} Return %": round(rg.follower_return_pct, 2),
             "Trades": rg.trades_count,
-            "Win Rate %": round(rg.win_rate, 1) if rg.trades_count > 0 else "-",
+            "Win Rate %": round(rg.win_rate, 1) if rg.trades_count > 0 else 0.0,
         })
     if day_rows:
         st.dataframe(pd.DataFrame(day_rows), use_container_width=True)
