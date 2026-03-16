@@ -228,8 +228,13 @@ def load_aligned_pair(leader_symbol: str, follower_symbol: str,
 
     Returns (ts, leader_prices, leader_vols, follower_prices, follower_vols).
     """
-    all_leader_trades = []
-    all_follower_trades = []
+    # Bin day-by-day to avoid loading all raw trades into memory at once.
+    # Raw trades for BTC can be ~200 bytes/dict × millions = 1GB+.
+    # Numpy arrays are only ~7MB/day, so concatenating those is fine.
+    l_ts_parts, l_price_parts, l_vol_parts = [], [], []
+    f_ts_parts, f_price_parts, f_vol_parts = [], [], []
+    total_leader = 0
+    total_follower = 0
 
     for day_offset in range(days):
         day_start = start_date + timedelta(days=day_offset)
@@ -242,17 +247,28 @@ def load_aligned_pair(leader_symbol: str, follower_symbol: str,
         follower_day = fetch_agg_trades(follower_symbol, day_start_ms, day_end_ms, cache_dir)
         console.print(f"    {leader_symbol}: {len(leader_day):,} | "
                       f"{follower_symbol}: {len(follower_day):,} trades")
+        total_leader += len(leader_day)
+        total_follower += len(follower_day)
 
-        all_leader_trades.extend(leader_day)
-        all_follower_trades.extend(follower_day)
+        # Bin immediately, then discard raw trades (saves ~1GB of RAM)
+        lt, lp, lv = trades_to_time_series(leader_day, bin_ms)
+        ft, fp, fv = trades_to_time_series(follower_day, bin_ms)
+        if len(lt) > 0:
+            l_ts_parts.append(lt); l_price_parts.append(lp); l_vol_parts.append(lv)
+        if len(ft) > 0:
+            f_ts_parts.append(ft); f_price_parts.append(fp); f_vol_parts.append(fv)
 
-    console.print(f"\n  [bold green]Total: {leader_symbol} {len(all_leader_trades):,} | "
-                  f"{follower_symbol} {len(all_follower_trades):,} trades[/]")
+    console.print(f"\n  [bold green]Total: {leader_symbol} {total_leader:,} | "
+                  f"{follower_symbol} {total_follower:,} trades[/]")
 
-    # Bin to VWAP time series
-    console.print(f"  Binning to {bin_ms}ms VWAP...")
-    l_ts, l_prices, l_vols = trades_to_time_series(all_leader_trades, bin_ms)
-    f_ts, f_prices, f_vols = trades_to_time_series(all_follower_trades, bin_ms)
+    # Concatenate per-day numpy arrays (~58MB for 30 days vs ~1.6GB raw dicts)
+    console.print(f"  Binned at {bin_ms}ms VWAP (day-by-day, low memory)...")
+    l_ts = np.concatenate(l_ts_parts)
+    l_prices = np.concatenate(l_price_parts)
+    l_vols = np.concatenate(l_vol_parts)
+    f_ts = np.concatenate(f_ts_parts)
+    f_prices = np.concatenate(f_price_parts)
+    f_vols = np.concatenate(f_vol_parts)
 
     # Align to common timestamps
     common_start = max(l_ts[0], f_ts[0])
