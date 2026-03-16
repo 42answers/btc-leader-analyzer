@@ -89,16 +89,25 @@ with st.sidebar:
                                         "Adds 5-15 min depending on data size.")
 
     with st.expander("Fallback / Manual Parameters", expanded=False):
-        st.caption("These are only used when Optuna is skipped. "
-                   "When Optuna runs, it finds optimal values automatically.")
-        tp_pct = st.number_input("Take-Profit %", min_value=0.01, max_value=5.0, value=0.15, step=0.05, format="%.2f")
-        sl_pct = st.number_input("Stop-Loss %", min_value=0.05, max_value=10.0, value=0.50, step=0.10, format="%.2f")
-        btc_threshold = st.number_input("BTC Threshold %", min_value=0.05, max_value=3.0, value=0.50, step=0.10, format="%.2f")
-        btc_window = st.number_input("BTC Window (seconds)", min_value=5, max_value=900, value=300, step=30)
-        max_hold = st.number_input("Max Hold (seconds)", min_value=30, max_value=3600, value=600, step=60)
-        cooldown = st.number_input("Cooldown (seconds)", min_value=10, max_value=600, value=60, step=10)
-        vol_ratio = st.number_input("Volume Ratio Filter", min_value=1.0, max_value=10.0, value=1.0, step=0.5, format="%.1f",
-                                    help="1.0 = disabled. Higher = only trade on volume spikes.")
+        st.caption("Used when Optuna is skipped. When Optuna runs, it optimizes "
+                   "btc_window, btc_threshold, TP, and SL automatically. "
+                   "Max hold, cooldown, and volume ratio are fixed based on research.")
+        tp_pct = st.number_input("Take-Profit %", min_value=0.10, max_value=2.0, value=0.20, step=0.05, format="%.2f",
+                                 help="Min 0.15% to clear fees+slippage on altcoins.")
+        sl_pct = st.number_input("Stop-Loss %", min_value=0.10, max_value=3.0, value=0.50, step=0.10, format="%.2f",
+                                 help="Min 0.20% to avoid noise stops from bid-ask bounce.")
+        btc_threshold = st.number_input("BTC Threshold %", min_value=0.05, max_value=2.0, value=0.30, step=0.05, format="%.2f",
+                                        help="Optuna searches 0.10-1.0%.")
+        btc_window = st.number_input("BTC Window (seconds)", min_value=5, max_value=300, value=60, step=15,
+                                     help="Optuna searches 5-120s. Catch-up is typically 10-120s.")
+        st.divider()
+        st.caption("**Fixed parameters** (not optimized — reduces overfitting)")
+        max_hold = st.number_input("Max Hold (seconds)", min_value=60, max_value=600, value=180, step=30,
+                                   help="Fixed at 180s. Catch-up completes in 60-120s per literature.")
+        cooldown = st.number_input("Cooldown (seconds)", min_value=15, max_value=120, value=45, step=15,
+                                   help="Fixed at 45s. Prevents correlated signals.")
+        vol_ratio = st.number_input("Volume Ratio Filter", min_value=1.0, max_value=5.0, value=2.0, step=0.5, format="%.1f",
+                                    help="Fixed at 2.0x. Filters noise trades without being too restrictive.")
 
     leverage_levels = st.multiselect("Leverage Levels", [1, 2, 3, 5, 10, 20], default=[1, 3, 5, 10])
     capital = st.number_input("Initial Capital (EUR)", min_value=100, max_value=100000, value=1000, step=100)

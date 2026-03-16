@@ -33,14 +33,22 @@ def optimize_parameters(
     fee_rt_pct = fee_profile.fee_per_leg * fee_profile.legs_per_trade * 100
     slip = slippage_bps / 10_000
 
+    # Fixed params (research-backed defaults — not optimized to reduce overfitting)
+    FIXED_MAX_HOLD_S = 180    # catch-up completes in 60-120s per literature; 180s buffer
+    FIXED_COOLDOWN_S = 45     # enough to avoid correlated signals
+    FIXED_VOL_RATIO = 2.0     # strong evidence volume filtering helps
+
     def objective(trial):
-        btc_window_s = trial.suggest_float("btc_window_s", 3, 300, log=True)
-        btc_threshold = trial.suggest_float("btc_threshold_pct", 0.05, 2.0, log=True)
-        tp_pct = trial.suggest_float("tp_pct", 0.05, 1.0, log=True)
-        sl_pct = trial.suggest_float("sl_pct", 0.1, 2.0, log=True)
-        max_hold_s = trial.suggest_float("max_hold_s", 30, 900, log=True)
-        cooldown_s = trial.suggest_float("cooldown_s", 10, 300, log=True)
-        min_vol_ratio = trial.suggest_float("min_volume_ratio", 1.0, 5.0)
+        # Only optimize 4 core parameters (narrowed ranges based on market microstructure research)
+        btc_window_s = trial.suggest_float("btc_window_s", 5, 120, log=True)
+        btc_threshold = trial.suggest_float("btc_threshold_pct", 0.10, 1.0, log=True)
+        tp_pct = trial.suggest_float("tp_pct", 0.15, 0.80, log=True)  # floor above fee+slippage
+        sl_pct = trial.suggest_float("sl_pct", 0.20, 1.5, log=True)   # floor above bid-ask noise
+
+        # Fixed parameters
+        max_hold_s = FIXED_MAX_HOLD_S
+        cooldown_s = FIXED_COOLDOWN_S
+        min_vol_ratio = FIXED_VOL_RATIO
 
         window_bins = max(1, int(btc_window_s / bin_s))
         max_hold_bins = max(1, int(max_hold_s / bin_s))
@@ -138,6 +146,10 @@ def optimize_parameters(
         study.optimize(objective, n_trials=n_trials, callbacks=[callback], show_progress_bar=False)
 
     best = study.best_params
+    # Include fixed params so downstream code gets all keys
+    best["max_hold_s"] = FIXED_MAX_HOLD_S
+    best["cooldown_s"] = FIXED_COOLDOWN_S
+    best["min_volume_ratio"] = FIXED_VOL_RATIO
     console.print(f"\n  [bold green]Best score:[/] {study.best_value:.4f}")
 
     # Get top trials
