@@ -366,20 +366,17 @@ with tab_overview:
         st.write(f"- **Avg net/trade:** {strat['avg_net_pct']:+.4f}%")
 
     with col2:
-        sp = res['meta']['strategy_params']
-        st.subheader(f"Parameters ({source_label})")
-        st.write(f"- **TP:** {sp['tp_pct']:.3f}%")
-        st.write(f"- **SL:** {sp['sl_pct']:.3f}%")
-        st.write(f"- **BTC threshold:** >{sp['btc_threshold_pct']:.3f}%")
-        st.write(f"- **BTC window:** {sp['btc_window_s']:.0f}s")
-        st.write(f"- **Max hold:** {sp['max_hold_s']:.0f}s")
-        st.write(f"- **Cooldown:** {sp['cooldown_s']:.0f}s")
+        corr_ov = res["correlation"]
+        st.subheader("Market Structure")
+        st.write(f"- **Pearson r:** {corr_ov['pearson_returns']:.3f}")
+        st.write(f"- **Beta:** {corr_ov['beta']:.2f}x")
+        st.write(f"- **Rel. volatility:** {corr_ov['relative_volatility']:.2f}x")
+        st.caption("See Market Structure tab for full analysis")
 
     with col3:
         st.subheader("Impulse Summary")
         imp = res["impulse_summary"]
         st.write(f"- **Total events detected:** {imp['total_events']:,}")
-        st.write(f"- **Median lag:** {imp['median_lag_ms']:.0f}ms")
         st.write(f"- **Mean already followed:** {imp['mean_followed_pct']:.0f}%")
         binary = imp.get("binary_response_pattern", {})
         if binary:
@@ -429,24 +426,23 @@ with tab_structure:
 
     with ac2:
         st.subheader("Regression")
-        st.write(f"- **Alpha:** {corr['alpha'] * 86400 * 100:.4f}%/day")
-        st.write(f"- **Beta:** {corr['beta']:.3f}")
-        st.write(f"- **R-squared:** {corr['r_squared']:.3f}")
+        st.write(f"- **Alpha (drift):** {corr['alpha'] * 86400 * 100:.4f}%/day")
         if corr["beta"] > 1.0:
-            st.caption(f"{coin} amplifies BTC moves by {corr['beta']:.1f}x on average")
+            st.write(f"- {coin} amplifies BTC moves by {corr['beta']:.1f}x on average")
         elif corr["beta"] < 1.0:
-            st.caption(f"{coin} dampens BTC moves (only {corr['beta']:.1f}x)")
+            st.write(f"- {coin} dampens BTC moves (only {corr['beta']:.1f}x)")
+        else:
+            st.write(f"- {coin} moves 1:1 with BTC")
 
     with ac3:
         st.subheader("Volume")
         st.write(f"- **Volume correlation:** {corr['volume_correlation']:.3f}")
-        st.write(f"- **Rel. volatility:** {corr['relative_volatility']:.2f}x")
         if corr["volume_correlation"] > 0.5:
-            st.caption("Strong volume coupling with BTC")
+            st.write("- Strong volume coupling with BTC")
         elif corr["volume_correlation"] > 0.2:
-            st.caption("Moderate volume coupling")
+            st.write("- Moderate volume coupling")
         else:
-            st.caption("Weak volume coupling — independent activity patterns")
+            st.write("- Weak volume coupling — independent activity patterns")
 
     # ── Section 2: Rolling correlation chart ───────────────────────
     st.divider()
