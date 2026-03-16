@@ -58,9 +58,9 @@ with st.sidebar:
     if custom_coin.strip():
         coin = custom_coin.strip().upper()
 
-    days = st.slider("Days to analyze", 7, 30, 14,
-                      help="14d default (Streamlit Cloud timeout ~10min). "
-                           "30d works once tick data is cached from a prior run.")
+    days = st.slider("Days to analyze", 7, 30, 30,
+                      help="30d recommended for robust walk-forward validation. "
+                           "First run downloads tick data (~5min); cached runs are instant.")
 
     fee_options = {
         "Binance Spot Taker (0.10%/leg)": "spot",
