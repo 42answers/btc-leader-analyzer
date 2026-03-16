@@ -58,8 +58,9 @@ with st.sidebar:
     if custom_coin.strip():
         coin = custom_coin.strip().upper()
 
-    days = st.slider("Days to analyze", 7, 30, 30,
-                      help="30 days recommended for regime diversity and robust walk-forward validation.")
+    days = st.slider("Days to analyze", 7, 30, 14,
+                      help="14d default (Streamlit Cloud timeout ~10min). "
+                           "30d works once tick data is cached from a prior run.")
 
     fee_options = {
         "Binance Spot Taker (0.10%/leg)": "spot",
@@ -322,7 +323,7 @@ if run_clicked:
         # Out-of-sample test (run Optuna params on preceding period)
         oos_result_data = None
         if not skip_optuna:
-            oos_days = days  # test on same length period before analysis window
+            oos_days = min(days, 14)  # cap at 14d to avoid Streamlit Cloud timeout
             oos_start = start_date - timedelta(days=oos_days)
             st.write(f"Step {step}/{n_steps}: Out-of-sample test ({oos_days}d before analysis window)...")
             try:
