@@ -21,14 +21,20 @@ def optimize_parameters(
     seed: int = 42,
     slippage_bps: float = 0.0,
     min_window_s: float = 5.0,
+    noise_floor_pct: float = 0.0,
+    btc_threshold_cap: float = 1.0,
 ) -> tuple[dict, dict]:
     """Run Optuna Bayesian optimization for TP/SL strategy parameters.
 
+    All search ranges are data-driven from the suitability pre-check:
+
     Args:
-        min_window_s: Minimum BTC window in seconds. Derived from the suitability
-            check — set to the smallest timescale where Pearson r >= 0.1.
-            Prevents Optuna from fitting to noise at timescales where the
-            follower doesn't actually track BTC.
+        min_window_s: Floor for btc_window_s. From suitability: smallest timescale
+            where Pearson r >= 0.1. Prevents fitting noise at uncorrelated scales.
+        noise_floor_pct: Follower 2σ noise in %. Sets floor for TP and SL so Optuna
+            can't pick targets below random price bounce (bid-ask noise).
+        btc_threshold_cap: BTC impulse P99 in %. Caps threshold range so Optuna
+            doesn't hunt for rare extreme events (overfitting to individual spikes).
 
     Returns (best_params: dict, study_summary: dict).
     """
@@ -40,9 +46,22 @@ def optimize_parameters(
     fee_rt_pct = fee_profile.fee_per_leg * fee_profile.legs_per_trade * 100
     slip = slippage_bps / 10_000
 
-    # Clamp window range based on suitability
+    # ── Data-driven search ranges ────────────────────────────────
+    # Window: floor from correlation timescale, ceiling 4x above
     window_lo = max(5.0, min_window_s)
-    window_hi = max(window_lo * 4, 120.0)  # at least 4x headroom above floor
+    window_hi = max(window_lo * 4, 120.0)
+
+    # TP: floor above noise + fees so we don't trade random bounce
+    tp_floor = max(0.15, noise_floor_pct, fee_rt_pct + slippage_bps / 50)
+    tp_ceil = max(tp_floor * 4, 0.80)
+
+    # SL: floor above noise so we don't get stopped by bid-ask bounce
+    sl_floor = max(0.20, noise_floor_pct)
+    sl_ceil = max(sl_floor * 5, 1.5)
+
+    # BTC threshold: cap at P99 so we get enough events to test
+    threshold_lo = 0.10
+    threshold_hi = max(0.30, min(btc_threshold_cap, 1.5))
 
     # Fixed params (research-backed defaults — not optimized to reduce overfitting)
     FIXED_MAX_HOLD_S = 180    # catch-up completes in 60-120s per literature; 180s buffer
@@ -50,11 +69,11 @@ def optimize_parameters(
     FIXED_VOL_RATIO = 2.0     # strong evidence volume filtering helps
 
     def objective(trial):
-        # Only optimize 4 core parameters (narrowed ranges based on market microstructure research)
+        # 4 core parameters with data-driven ranges
         btc_window_s = trial.suggest_float("btc_window_s", window_lo, window_hi, log=True)
-        btc_threshold = trial.suggest_float("btc_threshold_pct", 0.10, 1.0, log=True)
-        tp_pct = trial.suggest_float("tp_pct", 0.15, 0.80, log=True)  # floor above fee+slippage
-        sl_pct = trial.suggest_float("sl_pct", 0.20, 1.5, log=True)   # floor above bid-ask noise
+        btc_threshold = trial.suggest_float("btc_threshold_pct", threshold_lo, threshold_hi, log=True)
+        tp_pct = trial.suggest_float("tp_pct", tp_floor, tp_ceil, log=True)
+        sl_pct = trial.suggest_float("sl_pct", sl_floor, sl_ceil, log=True)
 
         # Fixed parameters
         max_hold_s = FIXED_MAX_HOLD_S
@@ -194,9 +213,9 @@ def optimize_parameters(
         "n_trials": n_trials,
         "search_ranges": {
             "btc_window_s": [window_lo, window_hi],
-            "btc_threshold_pct": [0.10, 1.0],
-            "tp_pct": [0.15, 0.80],
-            "sl_pct": [0.20, 1.5],
+            "btc_threshold_pct": [threshold_lo, threshold_hi],
+            "tp_pct": [tp_floor, tp_ceil],
+            "sl_pct": [sl_floor, sl_ceil],
         },
     }
 

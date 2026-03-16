@@ -258,26 +258,76 @@ if run_clicked:
             st.success(f"✅ {coin} follows BTC even at 1s ({suit_results[1]:.3f}). "
                        f"Strongest at {labels[best_ts]} ({best_r:.3f}). Suitable for catch-up trading.")
 
-        # Determine minimum window from suitability: smallest timescale with r >= 0.1
-        min_window_from_suit = 5.0  # default (good follower)
+        # ── Derive Optuna constraints from data ─────────────────────
+        # 1) Min window: smallest timescale where Pearson r >= 0.1
+        min_window_from_suit = 5.0
         for ts_scale in [1, 10, 60, 300]:
             if suit_results.get(ts_scale, 0) >= 0.1:
                 min_window_from_suit = float(ts_scale)
                 break
+
+        # 2) Cross-correlation peak lag → suggested window center
+        from scipy.signal import correlate
+        btc_ret_1s = np.diff(btc_p) / btc_p[:-1]
+        fol_ret_1s = np.diff(f_p) / f_p[:-1]
+        max_lag = 120  # check up to 120s
+        n_ccf = min(len(btc_ret_1s), len(fol_ret_1s))
+        ccf_seg_btc = btc_ret_1s[:n_ccf]
+        ccf_seg_fol = fol_ret_1s[:n_ccf]
+        # Normalize
+        ccf_seg_btc = (ccf_seg_btc - ccf_seg_btc.mean()) / (ccf_seg_btc.std() + 1e-12)
+        ccf_seg_fol = (ccf_seg_fol - ccf_seg_fol.mean()) / (ccf_seg_fol.std() + 1e-12)
+        ccf_full = np.correlate(ccf_seg_btc[:50000], ccf_seg_fol[:50000], mode='full')
+        mid = len(ccf_full) // 2
+        ccf_positive = ccf_full[mid:mid + max_lag]  # positive lags only (BTC leads)
+        peak_lag_s = int(np.argmax(ccf_positive)) if len(ccf_positive) > 0 else 30
+        peak_lag_s = max(peak_lag_s, 1)
+
+        # 3) Noise floor: follower 1s return std → sets TP/SL floor
+        fol_noise_std = float(np.std(fol_ret_1s) * 100)  # in %
+        # 2σ captures 95% of noise bounces — TP/SL below this is pure noise
+        noise_floor_pct = round(fol_noise_std * 2, 4)
+
+        # 4) BTC impulse magnitude distribution → caps threshold range
+        btc_ret_window = np.abs(np.diff(btc_p[::max(1, int(min_window_from_suit))]) /
+                                btc_p[::max(1, int(min_window_from_suit))][:-1] * 100)
+        btc_p95 = float(np.percentile(btc_ret_window, 95)) if len(btc_ret_window) > 10 else 0.5
+        btc_p99 = float(np.percentile(btc_ret_window, 99)) if len(btc_ret_window) > 10 else 1.0
+
+        # Bundle constraints for Optuna
+        optuna_hints = {
+            "min_window_s": min_window_from_suit,
+            "peak_lag_s": peak_lag_s,
+            "noise_floor_pct": noise_floor_pct,
+            "btc_p95_pct": btc_p95,
+            "btc_p99_pct": btc_p99,
+        }
+        suitability["optuna_hints"] = optuna_hints
+
+        st.write(f"  Optuna hints: peak lag={peak_lag_s}s | "
+                 f"noise floor={noise_floor_pct:.3f}% | "
+                 f"BTC impulse P95={btc_p95:.3f}% P99={btc_p99:.3f}%")
 
         # Step 3: Optuna optimization (finds optimal params)
         optuna_result = None
         params_source = "manual"
         if not skip_optuna:
             st.write(f"Step 3/{n_steps}: Optuna parameter optimization (300 trials)...")
+            constraints_log = []
             if min_window_from_suit > 5:
-                st.write(f"  Window floor set to {min_window_from_suit:.0f}s (correlation-based)")
+                constraints_log.append(f"window ≥{min_window_from_suit:.0f}s (correlation)")
+            if noise_floor_pct > 0.15:
+                constraints_log.append(f"TP/SL ≥{noise_floor_pct:.3f}% (noise floor)")
+            if constraints_log:
+                st.write(f"  Constraints: {' | '.join(constraints_log)}")
             from optimize import optimize_parameters
             best_params, opt_summary = optimize_parameters(
                 ts, btc_p, btc_v, ts, f_p, f_v,
                 fee_profile, leverage=1.0, n_trials=300,
                 slippage_bps=slippage_bps_val,
                 min_window_s=min_window_from_suit,
+                noise_floor_pct=noise_floor_pct,
+                btc_threshold_cap=btc_p99,
             )
             optuna_result = {"best_params": best_params, "summary": opt_summary}
 
