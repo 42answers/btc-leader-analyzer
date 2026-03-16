@@ -472,10 +472,11 @@ tab_overview, tab_structure, tab_strategy, tab_baseline, tab_regime, tab_risk, t
 
 # ── Tab 1: Overview ───────────────────────────────────────────────
 with tab_overview:
+    is_label = " (In-Sample)" if params_source == "optuna" else ""
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Win Rate", f"{strat['win_rate']:.1f}%")
+    c1.metric(f"Win Rate{is_label}", f"{strat['win_rate']:.1f}%")
     c2.metric("Trades", strat["total_trades"])
-    c3.metric("Net Return", f"{strat['total_net_pct']:+.2f}%")
+    c3.metric(f"Net Return{is_label}", f"{strat['total_net_pct']:+.2f}%")
     c4.metric("Max Drawdown", f"{strat['max_drawdown_pct']:.1f}%")
     c5.metric("Beats Random", f"{baseline['percentile_rank_wr']:.0f}%")
 
@@ -534,6 +535,73 @@ with tab_overview:
             st.write(f"- **No response:** {binary.get('no_response_pct', 0):.0f}%")
             st.write(f"- **Full follow:** {binary.get('full_follow_pct', 0):.0f}%")
             st.write(f"- **Overshoot:** {binary.get('overshoot_pct', 0):.0f}%")
+
+    # ── Validation results (OOS + Walk-Forward) ──────────────────
+    oos_data = res.get("oos")
+    wf_data = res.get("walkforward")
+
+    if oos_data or wf_data:
+        st.divider()
+        st.subheader("Validation (Out-of-Sample)")
+        st.caption("These metrics are tested on data Optuna never saw \u2014 the numbers you should trust.")
+
+        if oos_data and wf_data:
+            vc1, vc2 = st.columns(2)
+        elif oos_data:
+            vc1 = st.container()
+        else:
+            vc2 = st.container()
+
+        if oos_data:
+            with vc1:
+                st.markdown("**Out-of-Sample Test**")
+                oos_wr = oos_data.get("win_rate", 0)
+                oos_avg = oos_data.get("avg_net", 0)
+                oos_total = oos_data.get("total_return", 0)
+                oos_trades = oos_data.get("n_trades", 0)
+
+                oc1, oc2, oc3, oc4 = st.columns(4)
+                oc1.metric("OOS Win Rate", f"{oos_wr:.1f}%",
+                           delta=f"{oos_wr - strat['win_rate']:.1f}pp vs IS")
+                oc2.metric("OOS Avg Net", f"{oos_avg:+.4f}%",
+                           delta=f"{oos_avg - strat['avg_net_pct']:+.4f}% vs IS")
+                oc3.metric("OOS Total Return", f"{oos_total:+.2f}%")
+                oc4.metric("OOS Trades", oos_trades)
+
+                # Verdict
+                if oos_avg > 0 and oos_wr > 50:
+                    st.success("Edge survives out-of-sample.")
+                elif oos_avg > 0:
+                    st.info("Positive OOS returns but low win rate \u2014 edge is fragile.")
+                else:
+                    st.error("OOS returns are negative \u2014 in-sample results are likely overfitted.")
+
+        if wf_data:
+            with vc2:
+                st.markdown("**Walk-Forward Validation**")
+                wf_agg = wf_data.get("aggregate_oos", {})
+                wf_deg = wf_data.get("degradation_pct", 0)
+                wf_folds = wf_data.get("n_folds", 0)
+                wf_wr = wf_agg.get("win_rate", 0)
+                wf_avg = wf_agg.get("avg_net", 0)
+
+                wc1, wc2, wc3, wc4 = st.columns(4)
+                wc1.metric("WF OOS Win Rate", f"{wf_wr:.1f}%")
+                wc2.metric("WF OOS Avg Net", f"{wf_avg:+.4f}%")
+                wc3.metric("Degradation", f"{wf_deg:.0f}%",
+                           help="How much worse OOS is vs in-sample. Lower = more robust.")
+                wc4.metric("Folds", wf_folds)
+
+                # Verdict
+                if wf_deg < 30 and wf_avg > 0:
+                    st.success(f"Robust: only {wf_deg:.0f}% degradation across {wf_folds} folds.")
+                elif wf_avg > 0:
+                    st.warning(f"Moderate degradation ({wf_deg:.0f}%) \u2014 edge exists but weakens out-of-sample.")
+                else:
+                    st.error(f"Walk-forward OOS is negative \u2014 strategy does not generalize.")
+    elif params_source == "optuna":
+        st.divider()
+        st.info("Enable **Walk-forward validation** in the sidebar for out-of-sample robustness testing.")
 
 # ── Tab 2: Market Structure ───────────────────────────────────────
 with tab_structure:
