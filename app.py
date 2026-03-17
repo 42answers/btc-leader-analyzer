@@ -52,9 +52,15 @@ with st.sidebar:
 
     st.header("Configuration")
 
-    coin_options = ["XRP", "ETH", "SOL", "DOGE", "ADA", "AVAX", "LINK", "DOT"]
-    coin = st.selectbox("Follower Coin", coin_options, index=0)
-    custom_coin = st.text_input("Or enter custom symbol", "", placeholder="e.g. MATIC")
+    # ETH is the only coin with proven micro-level catch-up dynamics (1-60s).
+    # Other coins show flat-weak correlation at these timescales.
+    # "Test any coin" allows experimentation but sets expectations.
+    coin_options = ["ETH"]
+    coin = st.selectbox("Follower Coin", coin_options, index=0,
+                        help="ETH is the only coin with proven micro-level catch-up dynamics with BTC "
+                             "(Pearson r grows from 0.03 at 1s to 0.61 at 60s). "
+                             "Use custom symbol to test others, but expect weak results.")
+    custom_coin = st.text_input("Or enter custom symbol", "", placeholder="e.g. SOL, DOGE, XRP")
     if custom_coin.strip():
         coin = custom_coin.strip().upper()
 
